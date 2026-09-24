@@ -593,15 +593,41 @@
       try { return Lampa.Utils.secondsToTime(seconds, true); } catch (e) { return ''; }
     }
 
-    // Хеш таймлайна должен совпадать с тем, что читает карточка Lampa
-    // (interaction/card.js): фильм — hash(original_title); серия —
-    // hash(season + (season>10?':':'') + episode + original_title).
+    // Lampa использует ДВА разных хеша таймлайна для серии:
+    //  - interaction/episode/episode.js: season + (season>10?':':'') + episode + original_name
+    //  - interaction/card.js:           season + (season>10?':'') + episode + original_title
+    // Фильм: hash(original_title). Пишем прогресс в оба, чтобы показывалось и в
+    // списке эпизодов карточки, и на карточке каталога.
+    function episodeHash(season, episode, title) {
+      return Lampa.Utils.hash('' + season + (season > 10 ? ':' : '') + episode + (title || ''));
+    }
+
+    function movieHash(title) {
+      return Lampa.Utils.hash('' + (title || ''));
+    }
+
     function timelineHash(season, episode) {
-      var title = (object.movie && object.movie.original_title) || '';
-      if (season) {
-        return Lampa.Utils.hash('' + season + (season > 10 ? ':' : '') + episode + title);
-      }
-      return Lampa.Utils.hash('' + title);
+      var movie = object.movie || {};
+      if (season) return episodeHash(season, episode, movie.original_name || movie.original_title);
+      return movieHash(movie.original_title);
+    }
+
+    // Объект таймлайна для плеера: пишет прогресс и по original_name, и по original_title.
+    function timelineFor(season, episode) {
+      var movie = object.movie || {};
+
+      if (!season) return Lampa.Timeline.view(movieHash(movie.original_title));
+
+      var primary = Lampa.Timeline.view(episodeHash(season, episode, movie.original_name || movie.original_title));
+      var alt = Lampa.Timeline.view(episodeHash(season, episode, movie.original_title));
+      var base = primary.handler;
+
+      primary.handler = function (percent, time, duration) {
+        base(percent, time, duration);
+        alt.handler(percent, time, duration);
+      };
+
+      return primary;
     }
 
     // Отметка для истории Lampa + fallback для карточки сериала.
@@ -615,10 +641,9 @@
       if (item && item.season) {
         try {
           var last = Lampa.Storage.cache('online_watched_last', 5000, {});
-          last[Lampa.Utils.hash('' + (movie.original_title || ''))] = {
-            season: item.season,
-            episode: item.episode
-          };
+          var entry = { season: item.season, episode: item.episode };
+          last[Lampa.Utils.hash('' + (movie.original_name || ''))] = entry;
+          last[Lampa.Utils.hash('' + (movie.original_title || ''))] = entry;
           Lampa.Storage.set('online_watched_last', last);
         } catch (e) {}
       }
@@ -674,7 +699,8 @@
 
       if (fields.timeline) {
         try {
-          html.find('.turbo-card__timeline').append(Lampa.Timeline.render(Lampa.Timeline.view(fields.timeline)));
+          var tl = typeof fields.timeline === 'object' ? fields.timeline : Lampa.Timeline.view(fields.timeline);
+          html.find('.turbo-card__timeline').append(Lampa.Timeline.render(tl));
         } catch (e) {}
       }
 
@@ -1031,7 +1057,7 @@
             (item.title ? ' · ' + item.title : ''),
           url: stream.url,
           headers: stream.headers,
-          timeline: Lampa.Timeline.view(hash),
+          timeline: timelineFor(item.season, item.episode),
           duration: item.duration,
           thumbnail: item.poster || null,
           isonline: true
