@@ -23,7 +23,7 @@
   var preferProxy = false;
 
   // --- ДИАГНОСТИКА (временно, для TV) -------------------------------------
-  var DIAG = true;
+  var DIAG = false;
 
   function hostOf(url) {
     try { return new URL(url).host; } catch (e) { return String(url || '').slice(0, 40); }
@@ -815,6 +815,13 @@
       filter.render().find('.filter--search').addClass('hide');
       filter.render().find('.filter--sort').addClass('hide');
 
+      // Lampa.Select.close() сам контроллер не возвращает — зовёт onBack.
+      // Без этого после закрытия фильтра контроллер остаётся 'select' и пульт
+      // залипает; akter_ref по той же причине задаёт filter.onBack.
+      filter.onBack = function () {
+        try { Lampa.Controller.toggle('content'); } catch (e) {}
+      };
+
       filter.onSelect = function (type, a, b) {
         if (type !== 'filter' || !serial) return;
 
@@ -831,9 +838,17 @@
         }
 
         saveSerialChoice();
-        buildSerialFilter();
-        renderSeason();
-        setTimeout(function () { Lampa.Select.close(); }, 10);
+
+        // Lampa.Filter сразу после onSelect синхронно переоткрывает групповой
+        // селект и держит контроллер 'select'. Поэтому закрываем селект и
+        // перерисовываем список ПОСЛЕ него — иначе пульт/стрелки залипают на
+        // фильтре (мышь работает мимо контроллера).
+        setTimeout(function () {
+          try { Lampa.Select.close(); } catch (e) {}
+          buildSerialFilter();
+          renderSeason();
+          try { Lampa.Controller.toggle('content'); } catch (e) {}
+        }, 20);
       };
 
       if (filter.addButtonBack) filter.addButtonBack();
