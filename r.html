@@ -5,19 +5,22 @@
 (function () {
   function reply(obj) { try { parent.postMessage(obj, '*'); } catch (e) {} }
 
-  var targets = [];
-  try { targets = JSON.parse(decodeURIComponent((location.hash || '').slice(1))); } catch (e) {}
+  var payload = {};
+  try { payload = JSON.parse(decodeURIComponent((location.hash || '').slice(1))); } catch (e) {}
 
-  if (!targets || !targets.length || !targets.map) { reply({ tuResolve: true, urls: [] }); return; }
+  var targets = payload && payload.urls;
+  var id = payload && payload.id;
+
+  if (!targets || !targets.length || !targets.map) { reply({ tuResolve: true, id: id, urls: [] }); return; }
 
   Promise.all(targets.map(function (url) {
     return fetch(url, { redirect: 'follow', referrer: location.href, credentials: 'omit' })
       .then(function (r) { return (r && r.url && r.url !== url) ? r.url : null; })
       ['catch'](function () { return null; });
   })).then(function (urls) {
-    reply({ tuResolve: true, urls: urls });
+    reply({ tuResolve: true, id: id, urls: urls });
   })['catch'](function () {
-    reply({ tuResolve: true, urls: [] });
+    reply({ tuResolve: true, id: id, urls: [] });
   });
 })();
 </script>

@@ -259,6 +259,7 @@
   // конечный superdupercdn-адрес обратно через postMessage.
   var RESOLVER_URL = 'https://chebaku.github.io/r.html';
   var IFRAME_TIMEOUT = 15000;
+  var iframeSeq = 0;
 
   function resolveViaIframe(urls) {
     return new Promise(function (resolve) {
@@ -268,6 +269,10 @@
         resolve(list.map(function () { return null; }));
         return;
       }
+
+      // Уникальный id: параллельные iframe-запросы не должны принимать чужие
+      // ответы postMessage (иначе поток и субтитры перепутываются).
+      var id = 'tu' + (++iframeSeq) + '_' + Date.now();
 
       var iframe = document.createElement('iframe');
       iframe.setAttribute('style', 'position:absolute;left:-9999px;width:1px;height:1px;border:0');
@@ -283,7 +288,7 @@
 
       function onMessage(e) {
         var d = e && e.data;
-        if (!d || !d.tuResolve) return;
+        if (!d || !d.tuResolve || d.id !== id) return;
         if (DIAG) diag('iframe ' + (d.urls ? d.urls.filter(Boolean).length : 0) + '/' + list.length);
         finish(d.urls || null);
       }
@@ -292,19 +297,27 @@
       setTimeout(function () { if (DIAG) diag('iframe timeout'); finish(null); }, IFRAME_TIMEOUT);
 
       try {
-        iframe.src = RESOLVER_URL + '#' + encodeURIComponent(JSON.stringify(list));
+        iframe.src = RESOLVER_URL + '#' + encodeURIComponent(JSON.stringify({ id: id, urls: list }));
         (document.body || document.documentElement).appendChild(iframe);
       } catch (e) { finish(null); }
     });
   }
 
   // Прямой резолв (быстрый, работает в вебе), а что не открылось — добираем
-  // одним iframe-батчем (нужно на Tizen с его file://).
+  // одним iframe-батчем (нужно на Tizen с его file://). С file:// прямой путь
+  // заведомо не проходит (нет Referer), поэтому сразу идём через iframe.
   function resolveBatch(urls) {
     var list = urls || [];
     if (!list.length) return Promise.resolve([]);
 
-    return Promise.all(list.map(resolveDirect)).then(function (results) {
+    var isFile = false;
+    try { isFile = location.protocol === 'file:'; } catch (e) {}
+
+    var direct = isFile
+      ? list.map(function () { return Promise.resolve(null); })
+      : list.map(resolveDirect);
+
+    return Promise.all(direct).then(function (results) {
       var missing = [];
       results.forEach(function (r, i) { if (!r) missing.push(i); });
       if (!missing.length) return results;
@@ -878,6 +891,7 @@
     }
 
     // Резолв потока дорожки -> { url, quality, headers, subtitles } либо null.
+    // Качества и субтитры резолвим ОДНИМ батчем (один iframe на Tizen).
     function buildStream(item, callback) {
       var all = (item.qualities || []).filter(function (entry) { return !!entry.url; });
       var target = playbackTarget(all);
@@ -885,14 +899,24 @@
       if (!target) { callback(null); return; }
 
       var numeric = all.filter(function (entry) { return entry.num; });
-      var subs = resolveSubs(item);
+      var qualityEntries = numeric.length ? numeric : [target];
+      var subs = (item.subtitles || []).filter(function (sub) { return sub.url; });
 
-      resolveQualities(numeric.length ? numeric : [target]).then(function (resolved) {
+      var urls = qualityEntries.map(function (entry) { return entry.url; })
+        .concat(subs.map(function (sub) { return sub.url; }));
+
+      resolveBatch(urls).then(function (resolved) {
+        resolved = resolved || [];
+
+        var pairs = qualityEntries.map(function (entry, i) {
+          return { entry: entry, url: resolved[i] || null };
+        });
+
         // Меню качества строит числовые ключи (метки приходят как "240p").
         var qualities = {};
         var playUrl = null;
 
-        resolved.forEach(function (pair) {
+        pairs.forEach(function (pair) {
           if (!pair.url) return;
           if (pair.entry.num) qualities[pair.entry.num] = pair.url;
           if (pair.entry === target) playUrl = pair.url;
@@ -902,7 +926,7 @@
         // открылось (любое числовое), чем сырой obrut-адрес — в вебе он 404.
         // Сырой адрес остаётся последним рубежом для нативного плеера.
         if (!playUrl) {
-          var opened = resolved.filter(function (pair) {
+          var opened = pairs.filter(function (pair) {
             return !!pair.url && pair.entry.num;
           }).sort(function (a, b) { return b.entry.num - a.entry.num; })[0];
           if (opened) playUrl = opened.url;
@@ -910,22 +934,25 @@
         if (!playUrl) playUrl = target.url;
         if (!playUrl) { callback(null); return; }
 
+        var subtitles = subs.map(function (sub, i) {
+          var url = resolved[qualityEntries.length + i];
+          return { label: sub.label, url: url || sub.url, index: sub.index };
+        });
+
         if (DIAG) {
-          var okN = resolved.filter(function (pair) { return !!pair.url; }).length;
-          diag('resolve ' + okN + '/' + (numeric.length || 1) +
+          var okN = resolved.filter(Boolean).length;
+          diag('resolve ' + okN + '/' + qualityEntries.length +
             ' | host=' + hostOf(playUrl) +
             (playUrl.indexOf('obrut.show') !== -1 ? ' [RAW OBRUT -> 404]' : ' [ok]'));
         }
 
-        subs.then(function (subtitles) {
-          callback({
-            url: playUrl,
-            quality: qualities,
-            // Нативный плеер (Android) умеет заголовки; браузер их игнорирует,
-            // поэтому в вебе опираемся на уже разрешённый адрес без гейта.
-            headers: { Referer: referer || originOf(target.url), 'User-Agent': UA },
-            subtitles: subtitles
-          });
+        callback({
+          url: playUrl,
+          quality: qualities,
+          // Нативный плеер (Android) умеет заголовки; браузер их игнорирует,
+          // поэтому в вебе опираемся на уже разрешённый адрес без гейта.
+          headers: { Referer: referer || originOf(target.url), 'User-Agent': UA },
+          subtitles: subtitles
         });
       });
     }
@@ -1053,6 +1080,9 @@
 
       scroll.body().addClass('turbo-list');
       files.appendFiles(scroll.render());
+      // Высоту скролла задаём всегда: без этого список растягивается по
+      // контенту и не прокручивается (фильмы с большим числом дорожек).
+      scroll.minus(files.render().find('.explorer__files-head'));
 
       Lampa.Controller.enable('content');
       this.loading(false);
