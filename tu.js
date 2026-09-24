@@ -183,7 +183,10 @@
   // редиректа не было (гейт не пройден) или fetch недоступен — null: тогда
   // играем исходный адрес, а на Android заголовки из element.headers доедут.
   // Резолв через XHR: на части TV-движков fetch урезан/недоступен, но XHR есть
-  // и умеет отдать конечный URL после 302 через responseURL.
+  // и умеет отдать конечный URL после 302 через responseURL. Дополнительно
+  // пробуем выставить Referer/User-Agent — на Tizen WebKit они иногда не
+  // считаются запрещёнными и доходят до сервера (в обычном браузере молча
+  // игнорируются), что и позволяет обойти Referer-гейт obrut с file://.
   function resolveViaXhr(url) {
     return new Promise(function (resolve) {
       if (typeof XMLHttpRequest !== 'function') { resolve(null); return; }
@@ -193,10 +196,17 @@
 
       try {
         xhr.open('GET', url, true);
+        try { xhr.setRequestHeader('Referer', 'https://linkpp.ink/'); } catch (e) {}
+        try { xhr.setRequestHeader('User-Agent', UA); } catch (e) {}
+
         xhr.onload = function () {
+          if (DIAG) diag('xhr ' + xhr.status + ' -> ' + hostOf(xhr.responseURL || url));
           resolve(xhr.responseURL && xhr.responseURL !== url ? xhr.responseURL : null);
         };
-        xhr.onerror = function () { resolve(null); };
+        xhr.onerror = function () {
+          if (DIAG) diag('xhr error');
+          resolve(null);
+        };
         xhr.ontimeout = function () { resolve(null); };
         xhr.send();
       } catch (e) { resolve(null); }
