@@ -22,6 +22,22 @@
 
   var preferProxy = false;
 
+  // --- ДИАГНОСТИКА (временно, для TV) -------------------------------------
+  var DIAG = true;
+
+  function hostOf(url) {
+    try { return new URL(url).host; } catch (e) { return String(url || '').slice(0, 40); }
+  }
+
+  function locInfo() {
+    try { return (location.protocol || '') + '//' + (location.host || ''); } catch (e) { return 'n/a'; }
+  }
+
+  function diag(msg) {
+    try { console.log('TURBO-DIAG', msg); } catch (e) {}
+    try { Lampa.Noty.show('TURBO: ' + msg); } catch (e) {}
+  }
+
   function isProxy(url) {
     return PROXIES.some(function (base) { return url.indexOf(base) === 0; });
   }
@@ -166,24 +182,48 @@
   // superdupercdn, который открыт (CORS *) и заголовков не требует. Если
   // редиректа не было (гейт не пройден) или fetch недоступен — null: тогда
   // играем исходный адрес, а на Android заголовки из element.headers доедут.
+  // Резолв через XHR: на части TV-движков fetch урезан/недоступен, но XHR есть
+  // и умеет отдать конечный URL после 302 через responseURL.
+  function resolveViaXhr(url) {
+    return new Promise(function (resolve) {
+      if (typeof XMLHttpRequest !== 'function') { resolve(null); return; }
+
+      var xhr;
+      try { xhr = new XMLHttpRequest(); } catch (e) { resolve(null); return; }
+
+      try {
+        xhr.open('GET', url, true);
+        xhr.onload = function () {
+          resolve(xhr.responseURL && xhr.responseURL !== url ? xhr.responseURL : null);
+        };
+        xhr.onerror = function () { resolve(null); };
+        xhr.ontimeout = function () { resolve(null); };
+        xhr.send();
+      } catch (e) { resolve(null); }
+    });
+  }
+
   function resolveStream(url) {
     if (!url) return Promise.resolve(null);
-    if (typeof fetch !== 'function') return Promise.resolve(null);
 
     var options = { redirect: 'follow', referrerPolicy: 'strict-origin-when-cross-origin' };
     try { options.referrer = location.href; } catch (e) {}
 
     function once() {
+      if (typeof fetch !== 'function') return resolveViaXhr(url);
+
       return fetch(url, options).then(function (response) {
         if (response && response.body && typeof response.body.cancel === 'function') {
           try { response.body.cancel(); } catch (e) {}
         }
-        if (!response || !response.url) return null;
+        if (!response || !response.url) return resolveViaXhr(url);
         // redirect: 'follow' выставляет redirected; если движок его не отдаёт —
         // считаем редиректом смену самого адреса.
         var shifted = response.redirected === true ||
           (response.redirected === undefined && response.url !== url);
-        return shifted ? response.url : null;
+        return shifted ? response.url : resolveViaXhr(url);
+      })['catch'](function () {
+        return resolveViaXhr(url);
       });
     }
 
@@ -776,6 +816,13 @@
         if (!playUrl) playUrl = target.url;
         if (!playUrl) { callback(null); return; }
 
+        if (DIAG) {
+          var okN = resolved.filter(function (pair) { return !!pair.url; }).length;
+          diag('resolve ' + okN + '/' + (numeric.length || 1) +
+            ' | host=' + hostOf(playUrl) +
+            (playUrl.indexOf('obrut.show') !== -1 ? ' [RAW OBRUT -> 404]' : ' [ok]'));
+        }
+
         subs.then(function (subtitles) {
           callback({
             url: playUrl,
@@ -852,6 +899,7 @@
         }
 
         try {
+          if (DIAG) diag('play host=' + hostOf(element.url) + ' q=' + Object.keys(stream.quality).length);
           Lampa.Player.play(element);
           if (element.playlist) Lampa.Player.playlist(element.playlist);
           // Как во встроенном rezka.js: element.subtitles достаточно только на
@@ -921,6 +969,13 @@
       }
 
       status('Поиск источника…');
+
+      if (DIAG) {
+        var plat = (Lampa.Platform && Lampa.Platform.is)
+          ? ['tizen', 'webos', 'android', 'orsay', 'netcast'].filter(function (p) { return Lampa.Platform.is(p); }).join(',')
+          : '?';
+        diag('loc=' + locInfo() + ' fetch=' + (typeof fetch) + ' xhr=' + (typeof XMLHttpRequest) + ' plat=' + plat);
+      }
 
       getKinopoiskId().then(function (id) {
         if (!id) {
