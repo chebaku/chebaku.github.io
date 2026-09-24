@@ -593,8 +593,35 @@
       try { return Lampa.Utils.secondsToTime(seconds, true); } catch (e) { return ''; }
     }
 
-    function watchHash(suffix) {
-      return Lampa.Utils.hash(movieTitle() + (suffix || ''));
+    // Хеш таймлайна должен совпадать с тем, что читает карточка Lampa
+    // (interaction/card.js): фильм — hash(original_title); серия —
+    // hash(season + (season>10?':':'') + episode + original_title).
+    function timelineHash(season, episode) {
+      var title = (object.movie && object.movie.original_title) || '';
+      if (season) {
+        return Lampa.Utils.hash('' + season + (season > 10 ? ':' : '') + episode + title);
+      }
+      return Lampa.Utils.hash('' + title);
+    }
+
+    // Отметка для истории Lampa + fallback для карточки сериала.
+    function markWatch(item) {
+      var movie = object.movie || {};
+
+      if (movie.id) {
+        try { if (Lampa.Favorite && Lampa.Favorite.add) Lampa.Favorite.add('history', movie, 100); } catch (e) {}
+      }
+
+      if (item && item.season) {
+        try {
+          var last = Lampa.Storage.cache('online_watched_last', 5000, {});
+          last[Lampa.Utils.hash('' + (movie.original_title || ''))] = {
+            season: item.season,
+            episode: item.episode
+          };
+          Lampa.Storage.set('online_watched_last', last);
+        } catch (e) {}
+      }
     }
 
     function isViewed(hash) {
@@ -682,7 +709,7 @@
       last = false;
 
       list.forEach(function (item, index) {
-        var hash = watchHash(':' + index);
+        var hash = timelineHash();
 
         var card = makeCard({
           title: item.title,
@@ -778,7 +805,7 @@
       var playlist = episodeList.map(function (episode) {
         return {
           track: episodeTrack(episode, serialVoice),
-          hash: watchHash(':' + episode.season + ':' + episode.number),
+          hash: timelineHash(episode.season, episode.number),
           sub: episode.sub,
           name: episode.name,
           season: episode.season,
@@ -790,7 +817,7 @@
 
       episodeList.forEach(function (episode) {
         var track = episodeTrack(episode, serialVoice);
-        var hash = watchHash(':' + episode.season + ':' + episode.number);
+        var hash = timelineHash(episode.season, episode.number);
 
         var card = makeCard({
           title: episode.name,
@@ -1021,6 +1048,7 @@
 
         try {
           if (DIAG) diag('play host=' + hostOf(element.url) + ' q=' + Object.keys(stream.quality).length);
+          markWatch(item);
           Lampa.Player.play(element);
           if (element.playlist) Lampa.Player.playlist(element.playlist);
           // Как во встроенном rezka.js: element.subtitles достаточно только на
