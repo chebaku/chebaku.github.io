@@ -1,0 +1,23 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>tu-resolver</title>
+<script>
+(function () {
+  function reply(obj) { try { parent.postMessage(obj, '*'); } catch (e) {} }
+
+  var targets = [];
+  try { targets = JSON.parse(decodeURIComponent((location.hash || '').slice(1))); } catch (e) {}
+
+  if (!targets || !targets.length || !targets.map) { reply({ tuResolve: true, urls: [] }); return; }
+
+  Promise.all(targets.map(function (url) {
+    return fetch(url, { redirect: 'follow', referrer: location.href, credentials: 'omit' })
+      .then(function (r) { return (r && r.url && r.url !== url) ? r.url : null; })
+      ['catch'](function () { return null; });
+  })).then(function (urls) {
+    reply({ tuResolve: true, urls: urls });
+  })['catch'](function () {
+    reply({ tuResolve: true, urls: [] });
+  });
+})();
+</script>

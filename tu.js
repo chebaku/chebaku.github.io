@@ -213,7 +213,7 @@
     });
   }
 
-  function resolveStream(url) {
+  function resolveDirect(url) {
     if (!url) return Promise.resolve(null);
 
     var options = { redirect: 'follow', referrerPolicy: 'strict-origin-when-cross-origin' };
@@ -252,14 +252,83 @@
     return attempt();
   }
 
+  // --- Резолв через скрытый iframe на https-домене плагина ---------------
+  // На Tizen приложение живёт на file://, поэтому fetch/XHR не шлют Referer и
+  // obrut отвечает 404. Страница r.html на нашем GitHub Pages имеет настоящий
+  // https-origin: её fetch уходит с валидным Referer, проходит гейт и отдаёт
+  // конечный superdupercdn-адрес обратно через postMessage.
+  var RESOLVER_URL = 'https://chebaku.github.io/r.html';
+  var IFRAME_TIMEOUT = 15000;
+
+  function resolveViaIframe(urls) {
+    return new Promise(function (resolve) {
+      var list = urls || [];
+      if (!list.length) { resolve([]); return; }
+      if (typeof document === 'undefined' || !window || typeof window.addEventListener !== 'function') {
+        resolve(list.map(function () { return null; }));
+        return;
+      }
+
+      var iframe = document.createElement('iframe');
+      iframe.setAttribute('style', 'position:absolute;left:-9999px;width:1px;height:1px;border:0');
+      var done = false;
+
+      function finish(result) {
+        if (done) return;
+        done = true;
+        try { window.removeEventListener('message', onMessage, false); } catch (e) {}
+        try { if (iframe.parentNode) iframe.parentNode.removeChild(iframe); } catch (e) {}
+        resolve(result || list.map(function () { return null; }));
+      }
+
+      function onMessage(e) {
+        var d = e && e.data;
+        if (!d || !d.tuResolve) return;
+        if (DIAG) diag('iframe ' + (d.urls ? d.urls.filter(Boolean).length : 0) + '/' + list.length);
+        finish(d.urls || null);
+      }
+
+      try { window.addEventListener('message', onMessage, false); } catch (e) {}
+      setTimeout(function () { if (DIAG) diag('iframe timeout'); finish(null); }, IFRAME_TIMEOUT);
+
+      try {
+        iframe.src = RESOLVER_URL + '#' + encodeURIComponent(JSON.stringify(list));
+        (document.body || document.documentElement).appendChild(iframe);
+      } catch (e) { finish(null); }
+    });
+  }
+
+  // Прямой резолв (быстрый, работает в вебе), а что не открылось — добираем
+  // одним iframe-батчем (нужно на Tizen с его file://).
+  function resolveBatch(urls) {
+    var list = urls || [];
+    if (!list.length) return Promise.resolve([]);
+
+    return Promise.all(list.map(resolveDirect)).then(function (results) {
+      var missing = [];
+      results.forEach(function (r, i) { if (!r) missing.push(i); });
+      if (!missing.length) return results;
+
+      return resolveViaIframe(missing.map(function (i) { return list[i]; })).then(function (extra) {
+        var k = 0;
+        missing.forEach(function (i) { results[i] = extra ? (extra[k++] || null) : null; });
+        return results;
+      });
+    });
+  }
+
+  function resolveStream(url) {
+    return resolveDirect(url);
+  }
+
   // Меню качества Lampa переключает уже готовые адреса, поэтому резолвим все
   // числовые качества разом — нерезолвленных ссылок в карте быть не должно.
   function resolveQualities(entries) {
-    return Promise.all(entries.map(function (entry) {
-      return resolveStream(entry.url).then(function (resolved) {
-        return { entry: entry, url: resolved };
+    return resolveBatch(entries.map(function (entry) { return entry.url; })).then(function (urls) {
+      return entries.map(function (entry, i) {
+        return { entry: entry, url: urls ? urls[i] : null };
       });
-    }));
+    });
   }
 
   // Auto плееру не нужен: цель — лучшее числовое качество, а выбор остального
@@ -779,11 +848,11 @@
       var subs = (item.subtitles || []).filter(function (sub) { return sub.url; });
       if (!subs.length) return Promise.resolve([]);
 
-      return Promise.all(subs.map(function (sub) {
-        return resolveStream(sub.url).then(function (resolved) {
-          return { label: sub.label, url: resolved || sub.url };
+      return resolveBatch(subs.map(function (sub) { return sub.url; })).then(function (urls) {
+        return subs.map(function (sub, i) {
+          return { label: sub.label, url: (urls && urls[i]) || sub.url, index: sub.index };
         });
-      }));
+      });
     }
 
     function applyStream(target, stream) {
