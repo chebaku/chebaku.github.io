@@ -649,10 +649,7 @@
       }
     }
 
-    // Отметка «просмотрено» — только при прогрессе >= 90% (общий таймлайн Lampa).
-    function isWatched(hash) {
-      try { return Lampa.Timeline.view(hash).percent >= 90; } catch (e) { return false; }
-    }
+    // Отметки «просмотрено» не рисуем — есть штатный прогресс-бар Lampa.
 
     function makeCard(fields) {
       var html = $(
@@ -661,7 +658,6 @@
             (fields.poster ? '<img>' : '') +
             '<div class="turbo-card__loader"></div>' +
             (fields.sub ? '<div class="turbo-card__sub">' + escapeHtml(fields.sub) + '</div>' : '') +
-            (fields.viewed ? '<div class="turbo-card__viewed">&#10003;</div>' : '') +
           '</div>' +
           '<div class="turbo-card__body">' +
             '<div class="turbo-card__head">' +
@@ -736,8 +732,7 @@
           poster: item.poster || posterUrl(movieArtwork()),
           time: timeText(item.duration),
           timeline: hash,
-          info: qualityList(item),
-          viewed: isWatched(hash)
+          info: qualityList(item)
         });
 
         card.on('hover:enter', function () {
@@ -843,8 +838,7 @@
           poster: episode.poster || posterUrl(movieArtwork()),
           time: timeText(episode.duration),
           timeline: hash,
-          info: qualityList(track),
-          viewed: isWatched(hash)
+          info: qualityList(track)
         });
 
         card.on('hover:enter', function () {
@@ -1036,7 +1030,24 @@
     function playStream(item, hash, options) {
       options = options || {};
 
+      // Резолв идёт сетевым запросом (на Tizen — через iframe), поэтому сразу
+      // показываем нативный лоадер, чтобы не было «мёртвой» паузы до плеера.
+      var load_on = true;
+      try {
+        Lampa.Loading.start(function () {
+          load_on = false;
+          try { Lampa.Loading.stop(); } catch (e) {}
+        }, 'Запускаю…');
+      } catch (e) {}
+      function stopLoad() {
+        if (!load_on) return;
+        load_on = false;
+        try { Lampa.Loading.stop(); } catch (e) {}
+      }
+
       buildStream(item, function (stream) {
+        stopLoad();
+
         if (!stream) {
           Lampa.Noty.show('Нет ссылки на поток');
           return;
@@ -1268,7 +1279,6 @@
       '.turbo-card__loader{position:absolute;top:0;left:0;right:0;bottom:0;background:linear-gradient(90deg,rgba(255,255,255,.05),rgba(255,255,255,.13),rgba(255,255,255,.05));background-size:200% 100%;animation:turbo-shimmer 1.2s infinite}',
       '@keyframes turbo-shimmer{0%{background-position:200% 0}100%{background-position:-200% 0}}',
       '.turbo-card__sub{position:absolute;left:.3em;bottom:.3em;padding:.1em .45em;border-radius:.25em;background:rgba(0,0,0,.65);font-size:.8em;font-weight:600}',
-      '.turbo-card__viewed{position:absolute;right:.3em;bottom:.3em;padding:.1em .45em;border-radius:.25em;background:rgba(20,200,212,.85);font-size:.8em;font-weight:600}',
       '.turbo-card__body{flex:1 1 auto;min-width:0}',
       '.turbo-card__head{display:flex;justify-content:space-between;gap:1em}',
       '.turbo-card__title{font-size:1.1em;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}',
