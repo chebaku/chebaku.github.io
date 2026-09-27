@@ -649,16 +649,9 @@
       }
     }
 
-    function isViewed(hash) {
-      return Lampa.Storage.cache('turbo_view', 5000, []).indexOf(hash) !== -1;
-    }
-
-    function markViewed(hash) {
-      var viewed = Lampa.Storage.cache('turbo_view', 5000, []);
-      if (viewed.indexOf(hash) === -1) {
-        viewed.push(hash);
-        Lampa.Storage.set('turbo_view', viewed);
-      }
+    // Отметка «просмотрено» — только при прогрессе >= 90% (общий таймлайн Lampa).
+    function isWatched(hash) {
+      try { return Lampa.Timeline.view(hash).percent >= 90; } catch (e) { return false; }
     }
 
     function makeCard(fields) {
@@ -744,11 +737,10 @@
           time: timeText(item.duration),
           timeline: hash,
           info: qualityList(item),
-          viewed: isViewed(hash)
+          viewed: isWatched(hash)
         });
 
         card.on('hover:enter', function () {
-          markViewed(hash);
           playStream(item, hash);
         });
 
@@ -852,11 +844,10 @@
           time: timeText(episode.duration),
           timeline: hash,
           info: qualityList(track),
-          viewed: isViewed(hash)
+          viewed: isWatched(hash)
         });
 
         card.on('hover:enter', function () {
-          markViewed(hash);
           playStream(track, hash, { playlist: playlist });
         });
 
@@ -1146,7 +1137,36 @@
         return;
       }
 
-      status('Поиск источника…');
+      // Нативный лоадер Lampa на время поиска источника (спиннер + текст).
+      var load_on = true;
+      var load_started = false;
+
+      function loadDone() {
+        load_on = false;
+        try { Lampa.Loading.stop(); } catch (e) {}
+      }
+
+      function load(text) {
+        if (!load_on) return;
+        try {
+          if (!load_started) {
+            load_started = true;
+            Lampa.Loading.start(function () {
+              loadDone();
+              try { Lampa.Activity.backward(); } catch (e) {}
+            }, text || 'Поиск источника…');
+          } else {
+            Lampa.Loading.setText(text);
+          }
+        } catch (e) {}
+      }
+
+      function fail(html) {
+        loadDone();
+        status(html);
+      }
+
+      load('Поиск источника…');
 
       if (DIAG) {
         var plat = (Lampa.Platform && Lampa.Platform.is)
@@ -1157,27 +1177,32 @@
 
       getKinopoiskId().then(function (id) {
         if (!id) {
-          status('Не удалось определить kinopoisk ID');
+          fail('Не удалось определить kinopoisk ID');
           return;
         }
+
+        load('Загружаю плеер…');
 
         return req(API_PLAYERS + id, 'text').then(function (data) {
           var embedUrl = turboUrlFrom(asObject(data));
 
           if (!embedUrl) {
-            status('Turbo недоступен для этого фильма');
+            fail('Turbo недоступен для этого фильма');
             return;
           }
+
+          load('Читаю дорожки…');
 
           return loadTracks(embedUrl).then(function (result) {
             var empty = !result || (result.serial ? !result.model.seasons.length : !result.items.length);
 
             if (empty) {
-              status(result && result.serial ? 'Серии не найдены' : 'Дорожки не найдены');
+              fail(result && result.serial ? 'Серии не найдены' : 'Дорожки не найдены');
               return;
             }
 
             return applyPreviews(result).then(function () {
+              loadDone();
               if (result.serial) startSerial(result.model);
               else renderItems(result.items);
             });
