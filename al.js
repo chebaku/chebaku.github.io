@@ -52,6 +52,34 @@
     return PROXIES.some(function (base) { return url.indexOf(base) === 0; });
   }
 
+  // --- Прокси для медиапотока --------------------------------------------
+  //
+  // CDN Alloha (*.vkvideo.cloud) отдаёт файлы только с заголовком Origin плеера,
+  // иначе 403. На Android Lampa играет нативно и Origin подставляет сама
+  // (element.headers), а в браузере и на Tizen — нет: Origin запрещено задавать
+  // из JS, а <video>/hls.js его не шлют.
+  //
+  // Решение — публичный прокси rte: он принимает произвольные заголовки в виде
+  // param/<Имя>=<значение>/ и добавляет их к запросу на своей стороне. Ссылки
+  // внутри HLS относительные — плеер достраивает их прямо в путь прокси, а
+  // прокси отрезает param-префикс спереди, поэтому сегменты и вложенные
+  // плейлисты уходят корректно, без ручного переписывания манифеста.
+  var proxyIndex = 0;
+
+  function proxStream(url, origin) {
+    if (!url) return url;
+    if (Lampa.Platform.is('android')) return url;
+    if (isProxy(url)) return url;
+
+    var base = PROXIES[proxyIndex++ % PROXIES.length];
+
+    return base +
+      'param/Origin=' + encodeURIComponent(origin) + '/' +
+      'param/Referer=' + encodeURIComponent(origin + '/') + '/' +
+      'param/User-Agent=' + encodeURIComponent(UA) + '/' +
+      url;
+  }
+
   // --- Сетевой слой (как в tu.js: прямой запрос, при неудаче — CORS-прокси) --
 
   function netOne(url, dataType, headers, post) {
@@ -639,7 +667,7 @@
     // озвучка из stream.hlsSource (выбранная или единственная).
     function toElement(stream, entry, item, hash) {
       var dict = qualityDict(entry);
-      var url = bestUrl(dict) || entry.url || null;
+      var url = proxStream(bestUrl(dict) || entry.url || null, stream.origin);
       if (!url) return null;
 
       var element = {
@@ -647,8 +675,9 @@
           (item.season ? ' S' + item.season + 'E' + item.episode : '') +
           (item.title ? ' · ' + item.title : ''),
         url: url,
-        // Нативный плеер (Android/Tizen) шлёт эти заголовки; CDN Alloha
-        // (*.vkvideo.cloud) требует Origin плеера, иначе 403.
+        // Нативный плеер (Android) шлёт эти заголовки сам; CDN Alloha
+        // (*.vkvideo.cloud) требует Origin плеера, иначе 403. В браузере и на
+        // Tizen заголовки подставляет прокси (proxStream).
         headers: {
           Origin: stream.origin,
           Referer: stream.origin + '/',
@@ -664,10 +693,19 @@
       if (item.episode) element.episode = item.episode;
 
       var nums = qualityNumbers(dict);
-      if (nums.length) element.quality = dict;
+      if (nums.length) {
+        // Меню качества Lampa тоже ходит на CDN — значения проксируем.
+        var qdict = {};
+        nums.forEach(function (n) { qdict[n] = proxStream(dict[n], stream.origin); });
+        element.quality = qdict;
+      }
 
       var subs = subsOf(stream.tracks);
-      if (subs.length) element.subtitles = subs;
+      if (subs.length) {
+        element.subtitles = subs.map(function (sub) {
+          return { label: sub.label, url: proxStream(sub.url, stream.origin), index: sub.index };
+        });
+      }
 
       return element;
     }
