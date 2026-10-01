@@ -16,16 +16,18 @@
   var API_PLAYERS = 'https://p.linkpp.ink/api/players?kinopoisk=';
   var EXTERNALIDS_URL = 'https://akter-black.com/externalids';
   var ALLOHA_API = 'https://api.alloha.tv/';
-  // ext.rte.net.ru:8443 — отдельный rte-прокси с egress в другой ASN (не
-  // Timeweb), поэтому обслуживает UHD-edge, который режет Timeweb. Ставим
-  // первым; узлы proxy4..7 — фолбэк.
-  var PROXIES = [
-    'https://ext.rte.net.ru:8443/',
-    'https://proxy4.rte.net.ru/',
+  // rte-узлы proxy4..7 (Timeweb): для API их хватает.
+  var API_PROXIES = [
     'https://proxy5.rte.net.ru/',
     'https://proxy6.rte.net.ru/',
+    'https://proxy4.rte.net.ru/',
     'https://proxy7.rte.net.ru/'
   ];
+
+  // ext.rte.net.ru:8443 — отдельный прокси с egress в другом ASN (не Timeweb),
+  // поэтому обслуживает UHD-edge, который режет Timeweb. Держим его только для
+  // МЕДИА (первым), чтобы разгрузить от API-запросов; rte-узлы — фолбэк.
+  var MEDIA_PROXIES = ['https://ext.rte.net.ru:8443/'].concat(API_PROXIES);
   var TIMEOUT = 15000;
 
   // Токен linkpp меняется, но живой. Если p.linkpp.ink не отдал Alloha —
@@ -307,7 +309,7 @@
   } catch (e) {}
 
   function isProxy(url) {
-    return PROXIES.some(function (base) { return url.indexOf(base) === 0; });
+    return MEDIA_PROXIES.some(function (base) { return url.indexOf(base) === 0; });
   }
 
   // --- Прокси для медиапотока --------------------------------------------
@@ -338,7 +340,7 @@
     if (Lampa.Platform.is('android')) return url;
     if (isProxy(url)) return url;
 
-    var proxy = base || PROXIES[proxyIndex++ % PROXIES.length];
+    var proxy = base || MEDIA_PROXIES[proxyIndex++ % MEDIA_PROXIES.length];
     if (base) dbg('proxy', 'locked ' + hostOf(proxy));
 
     return mediaProxyUrl(proxy, url, origin);
@@ -368,12 +370,12 @@
     return new Promise(function (resolve) {
       var i = 0;
       (function next() {
-        if (i >= PROXIES.length) {
+        if (i >= MEDIA_PROXIES.length) {
           dbg('proxy', 'нет рабочего прокси (все узлы 403)');
           resolve(false);
           return;
         }
-        var base = PROXIES[i++];
+        var base = MEDIA_PROXIES[i++];
         probeProxy(base, url, origin).then(function (ok) {
           if (ok) { dbg('proxy', 'выбран ' + hostOf(base)); resolve(base); }
           else { dbg('proxy', hostOf(base) + ' FAIL'); next(); }
@@ -428,7 +430,7 @@
     // На Android у Lampa нативный сетевой слой — CORS/запрещённых заголовков
     // нет, поэтому прокси не нужны. В вебе — пробуем прокси.
     if (!Lampa.Platform.is('android')) {
-      var proxied = PROXIES.map(function (base) { return base + url; });
+      var proxied = API_PROXIES.map(function (base) { return base + url; });
       order = preferProxy ? proxied.concat([url]) : [url].concat(proxied);
     }
 
