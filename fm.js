@@ -180,6 +180,62 @@
     return safe.length ? safe[safe.length - 1] : Math.max.apply(null, list);
   }
 
+  // player_links -> модель { movies: [...] } либо { seasons: [...] }.
+  function buildModel(post) {
+    var pl = (post && post.player_links) || {};
+
+    var movieObj = pl.movie || {};
+    var movieKeys = Object.keys(movieObj);
+    if (movieKeys.length) {
+      var movies = [];
+      movieKeys.forEach(function (k) {
+        var f = movieObj[k] || {};
+        var q = qualitiesOf(f);
+        if (!q.length) return;
+        movies.push({
+          key: k,
+          translation: f.translation || ('Озвучка ' + (movies.length + 1)),
+          qualities: q,
+          blocked: /Заблокировано правообладателем/i.test(f.translation || '')
+        });
+      });
+      if (movies.length) {
+        // Заблокированные правообладателем — в конец списка.
+        movies.sort(function (a, b) { return (a.blocked ? 1 : 0) - (b.blocked ? 1 : 0); });
+        return { movies: movies };
+      }
+    }
+
+    var playlist = pl.playlist || {};
+    var seasonKeys = Object.keys(playlist);
+    if (seasonKeys.length) {
+      var seasons = [];
+      seasonKeys.forEach(function (sid, si) {
+        var seasonObj = playlist[sid] || {};
+        var sNum = num(sid, si + 1);
+        var voiceKeys = Object.keys(seasonObj);
+        var voices = [];
+
+        voiceKeys.forEach(function (vname) {
+          var epsObj = seasonObj[vname] || {};
+          var eps = [];
+          Object.keys(epsObj).forEach(function (eid, ei) {
+            var file = epsObj[eid] || {};
+            var q = qualitiesOf(file);
+            if (!q.length) return;
+            eps.push({ id: eid, number: num(eid, ei + 1), qualities: q });
+          });
+          if (eps.length) voices.push({ id: vname, name: vname, episodes: eps });
+        });
+
+        if (voices.length) seasons.push({ id: sid, number: sNum, voices: voices });
+      });
+      if (seasons.length) return { seasons: seasons };
+    }
+
+    return null;
+  }
+
   function norm(s) {
     return String(s == null ? '' : s).toLowerCase().replace(/[^a-zа-яё0-9]+/gi, ' ').trim();
   }
@@ -562,62 +618,7 @@
       renderSeason();
     }
 
-    // --- Разбор post ---
-
-    function buildModel(post) {
-      var pl = (post && post.player_links) || {};
-
-      var movieObj = pl.movie || {};
-      var movieKeys = Object.keys(movieObj);
-      if (movieKeys.length) {
-        var movies = [];
-        movieKeys.forEach(function (k) {
-          var f = movieObj[k] || {};
-          var q = qualitiesOf(f);
-          if (!q.length) return;
-          movies.push({
-            key: k,
-            translation: f.translation || ('Озвучка ' + (movies.length + 1)),
-            qualities: q,
-            blocked: /Заблокировано правообладателем/i.test(f.translation || '')
-          });
-        });
-        if (movies.length) {
-          // Заблокированные правообладателем — в конец списка.
-          movies.sort(function (a, b) { return (a.blocked ? 1 : 0) - (b.blocked ? 1 : 0); });
-          return { movies: movies };
-        }
-      }
-
-      var playlist = pl.playlist || {};
-      var seasonKeys = Object.keys(playlist);
-      if (seasonKeys.length) {
-        var seasons = [];
-        seasonKeys.forEach(function (sid, si) {
-          var seasonObj = playlist[sid] || {};
-          var sNum = num(sid, si + 1);
-          var voiceKeys = Object.keys(seasonObj);
-          var voices = [];
-
-          voiceKeys.forEach(function (vname) {
-            var epsObj = seasonObj[vname] || {};
-            var eps = [];
-            Object.keys(epsObj).forEach(function (eid, ei) {
-              var file = epsObj[eid] || {};
-              var q = qualitiesOf(file);
-              if (!q.length) return;
-              eps.push({ id: eid, number: num(eid, ei + 1), qualities: q });
-            });
-            if (eps.length) voices.push({ id: vname, name: vname, episodes: eps });
-          });
-
-          if (voices.length) seasons.push({ id: sid, number: sNum, voices: voices });
-        });
-        if (seasons.length) return { seasons: seasons };
-      }
-
-      return null;
-    }
+    // Разбор post — buildModel на уровне модуля (см. ниже).
 
     function loadPost(id) {
       postId = id;
@@ -857,6 +858,7 @@
       bracketQualities: bracketQualities,
       fileTmpl: fileTmpl,
       qualitiesOf: qualitiesOf,
+      buildModel: buildModel,
       defaultQuality: defaultQuality,
       norm: norm,
       durationSeconds: durationSeconds,
