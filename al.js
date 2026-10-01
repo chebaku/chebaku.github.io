@@ -365,9 +365,8 @@
       var i = 0;
       (function next() {
         if (i >= PROXIES.length) {
-          var fallback = PROXIES[proxyIndex++ % PROXIES.length];
-          dbg('proxy', 'нет рабочего прокси, беру ' + hostOf(fallback));
-          resolve(fallback);
+          dbg('proxy', 'нет рабочего прокси (все узлы 403)');
+          resolve(false);
           return;
         }
         var base = PROXIES[i++];
@@ -957,6 +956,7 @@
     // с текущей позиции (Lampa сама доигрывает по timeline).
     var watchdog = null;
     var currentPlay = null;      // { item, hash, pick, playlist }
+    var voicesList = null;       // список озвучек фильма (для фолбэка)
     var lastPos = -1;
     var lastPosAt = 0;
     var restarting = false;
@@ -1268,6 +1268,7 @@
       var dict = qualityDict(entry);
       var mainUrl = bestUrl(dict) || entry.url || null;
       return chooseProxy(mainUrl, stream.origin).then(function (base) {
+        if (base === false) return null;      // ни один прокси не отдал поток
         return toElement(stream, entry, item, hash, base);
       });
     }
@@ -1374,7 +1375,16 @@
 
           var chosen = pickTrack(stream, cp.pick);
           buildElement(stream, chosen, cp.item, cp.hash).then(function (el) {
-            if (!el) { restarting = false; Lampa.Noty.show('Не удалось перезапустить поток'); return; }
+            if (!el) {
+              restarting = false;
+              dbg('fallback', 'перезапуск не удался (403)');
+              if (voicesList && voicesList.indexOf(cp.item) !== -1 && voicesList.length > 1) {
+                playVoicesFrom(cp.item, cp.hash);
+              } else {
+                Lampa.Noty.show('Не удалось перезапустить поток');
+              }
+              return;
+            }
 
             if (at && dur) {
               el.timeline.time = at;
@@ -1395,23 +1405,36 @@
       });
     }
 
-    // Фильм: озвучка выбирает физический файл (translation=), POST отдаёт его
-    // дорожки. Поток обычно уже прогрет decorateCard; дорожку подбираем молча
-    // (pickTrack), без лишнего диалога выбора.
-    function playMovieCard(item, hash) {
+    // Порядок озвучек от выбранной по кругу. Если edge озвучки блокирует
+    // rte (403), автоматически пробуем следующую — у другой озвучки обычно
+    // другой CDN-edge, который прокси обслуживает.
+    function playVoicesFrom(item, hash) {
+      var start = voicesList ? voicesList.indexOf(item) : -1;
+      if (start < 0) start = 0;
+      var order = voicesList
+        ? voicesList.slice(start).concat(voicesList.slice(0, start))
+        : [item];
+      tryVoice(order, 0, hash);
+    }
+
+    function tryVoice(list, index, hash) {
+      if (index >= list.length) {
+        Lampa.Noty.show('Поток недоступен: все озвучки отдают 403');
+        return;
+      }
+
+      var item = list[index];
       withLoader(function (stopLoad) {
         resolveStream(item.iframe, token, PLAY_TTL).then(function (stream) {
           stopLoad();
-
-          if (!stream) {
-            Lampa.Noty.show('Нет ссылки на поток');
-            return;
-          }
+          if (!stream) { tryVoice(list, index + 1, hash); return; }
 
           var chosen = pickTrack(stream, item.title);
           buildElement(stream, chosen, item, hash).then(function (element) {
             if (!element) {
-              Lampa.Noty.show('Нет ссылки на поток');
+              dbg('fallback', 'озвучка недоступна: ' + item.title + ' -> следующая');
+              if (index > 0) Lampa.Noty.show('«' + list[index - 1].title + '» недоступна — включаю «' + item.title + '»');
+              tryVoice(list, index + 1, hash);
               return;
             }
 
@@ -1422,11 +1445,14 @@
       });
     }
 
+    function playMovieCard(item, hash) { playVoicesFrom(item, hash); }
+
     // --- Отрисовка: фильм (карточки = озвучки) ------------------------------
 
     function renderItems(list) {
       scroll.body().empty();
       last = false;
+      voicesList = list;
 
       var hash = timelineHash();
 
