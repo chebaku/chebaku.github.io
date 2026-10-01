@@ -624,6 +624,7 @@
       withLoader(function (stopLoad) {
         apiGet('post/' + id).then(function (post) {
           stopLoad();
+          if (!post) { status('Filmix API недоступен'); return; }
           var pl = (post && post.player_links) || {};
           log('post', id, 'movie=', pl.movie ? Object.keys(pl.movie).length : 0,
             'playlist=', pl.playlist ? Object.keys(pl.playlist).length : 0);
