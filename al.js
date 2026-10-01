@@ -3,7 +3,9 @@
 // api.alloha.tv (метаданные + каталожные озвучки) -> страница плеера (viewporti
 // + fileList) -> POST /bnsi/movies/<active.id> -> hlsSource (звуковые дорожки
 // файла с качествами) + tracks (субтитры). Карточки фильма — каталожные
-// озвучки, карточки сериала — серии; поток резолвится по клику. Заголовок
+// озвучки, карточки сериала — серии; потоки прогреваются в фоне и в карточке
+// показываются реальные качества и субтитры, а дорожка озвучки подбирается
+// молча (без лишнего диалога). Заголовок
 // Borth = sha256('fp|'+viewporti) + '|' + подпись(viewporti). CDN
 // (*.vkvideo.cloud) отдаёт поток только с заголовком Origin плеера.
 (function () {
@@ -418,6 +420,108 @@
     return null;
   }
 
+  // --- Прогрев карточек: реальные качества и субтитры из /bnsi -------------
+  //
+  // Реальных качеств и субтитров в метаданных api.alloha.tv нет — они приходят
+  // только из ответа /bnsi, причём набор (hlsSource) у каждого translation
+  // свой (§6.1 журнала). Поэтому карточки прогреваем в фоне: резолвим поток
+  // заранее и обновляем подпись; кэш потом отдаёт поток по клику мгновенно.
+
+  var streamCache = {};
+  var resolveActive = 0;
+  var resolveQueue = [];
+  var RESOLVE_MAX = 2;
+
+  function pumpResolve() {
+    while (resolveActive < RESOLVE_MAX && resolveQueue.length) {
+      (function (job) {
+        resolveActive++;
+        fetchStream(job.iframe, job.token).then(function (stream) {
+          resolveActive--;
+          if (!stream) delete streamCache[job.iframe];
+          job.resolve(stream);
+          pumpResolve();
+        }, function () {
+          resolveActive--;
+          delete streamCache[job.iframe];
+          job.resolve(null);
+          pumpResolve();
+        });
+      })(resolveQueue.shift());
+    }
+  }
+
+  // iframe -> Promise<stream>. Дублирующиеся запросы дедуплицируются кэшем,
+  // параллелизм ограничен RESOLVE_MAX, чтобы не завалить /bnsi пачкой.
+  function resolveStream(iframe, token) {
+    if (!iframe) return Promise.resolve(null);
+    if (streamCache[iframe]) return streamCache[iframe];
+
+    var p = new Promise(function (resolve) {
+      resolveQueue.push({ iframe: iframe, token: token, resolve: resolve });
+      pumpResolve();
+    });
+
+    streamCache[iframe] = p;
+    return p;
+  }
+
+  // Мягкий выбор дорожки физического файла: совпадение с выбранной озвучкой →
+  // первая русская → первая. Диалог не показываем: озвучку пользователь уже
+  // выбрал карточкой, а один translation может содержать несколько дорожек
+  // (§6.1), из-за чего и вылезал лишний выбор.
+  function pickTrack(stream, preferred) {
+    var list = (stream && stream.hlsSource) || [];
+    if (!list.length) return null;
+
+    var matched = findTrack(stream, preferred);
+    if (matched) return matched;
+
+    var russian = list.filter(function (src) {
+      return /\(russian\)|\b(rus|рус)/i.test(src.label || '');
+    });
+
+    return russian[0] || list[0];
+  }
+
+  function maxQuality(stream) {
+    var max = 0;
+    ((stream && stream.hlsSource) || []).forEach(function (src) {
+      qualityNumbers(qualityDict(src)).forEach(function (n) { if (n > max) max = n; });
+    });
+    return max;
+  }
+
+  function cleanLabel(label) {
+    return String(label == null ? '' : label).replace(/^\([^)]*\)\s*/, '').trim();
+  }
+
+  function qualityText(nums) {
+    return (nums || []).map(function (n) { return n + 'p'; }).join(' / ');
+  }
+
+  // Объединённые качества всех дорожек файла + список субтитров.
+  function describeStream(stream) {
+    if (!stream) return '';
+
+    var union = {};
+    (stream.hlsSource || []).forEach(function (src) {
+      qualityNumbers(qualityDict(src)).forEach(function (n) { union[n] = true; });
+    });
+    var nums = Object.keys(union).map(Number).sort(function (a, b) { return a - b; });
+
+    var parts = [];
+    if (nums.length) parts.push(qualityText(nums));
+
+    var subs = subsOf(stream.tracks);
+    if (subs.length) {
+      var labels = subs.map(function (s) { return cleanLabel(s.label); }).filter(Boolean);
+      parts.push('субтитры: ' + (labels.length ? labels.join(', ') : subs.length));
+    }
+
+    return parts.join(' · ');
+  }
+
   // Сериал: сезоны -> серии, у серии карта "озвучка -> {iframe, quality}".
   function serialModel(meta) {
     var voices = [];
@@ -611,7 +715,7 @@
           '<div class="alloha-card__img">' +
             (fields.poster ? '<img>' : '') +
             '<div class="alloha-card__loader"></div>' +
-            (fields.sub ? '<div class="alloha-card__sub">' + escapeHtml(fields.sub) + '</div>' : '') +
+            '<div class="alloha-card__sub' + (fields.sub ? '' : ' hide') + '">' + escapeHtml(fields.sub || '') + '</div>' +
           '</div>' +
           '<div class="alloha-card__body">' +
             '<div class="alloha-card__head">' +
@@ -619,7 +723,7 @@
               (fields.time ? '<div class="alloha-card__time">' + escapeHtml(fields.time) + '</div>' : '') +
             '</div>' +
             (fields.timeline ? '<div class="alloha-card__timeline"></div>' : '') +
-            (fields.info ? '<div class="alloha-card__info">' + escapeHtml(fields.info) + '</div>' : '') +
+            '<div class="alloha-card__info">' + escapeHtml(fields.info || '') + '</div>' +
           '</div>' +
         '</div>'
       );
@@ -653,6 +757,29 @@
       });
 
       return html;
+    }
+
+    // Фоновый прогрев карточки: резолвим /bnsi и обновляем подпись реальными
+    // качествами/субтитрами. Для фильмов максимальное качество уходит в бейдж;
+    // у серий бейдж занят номером серии — там обновляем только info.
+    function decorateCard(card, iframe, voice, useBadge) {
+      resolveStream(iframe, token).then(function (stream) {
+        if (!stream) return;
+
+        var info = describeStream(stream);
+        if (info) card.find('.alloha-card__info').text(info);
+
+        if (!useBadge) return;
+        var max = maxQuality(stream);
+        if (!max) return;
+
+        var badge = card.find('.alloha-card__sub');
+        if (!badge.length) {
+          badge = $('<div class="alloha-card__sub"></div>');
+          card.find('.alloha-card__img').append(badge);
+        }
+        badge.removeClass('hide').text(max + 'p');
+      });
     }
 
     function focusFirst() {
@@ -727,25 +854,6 @@
       });
     }
 
-    // Дорожек несколько (все озвучки физического файла). Если среди них есть
-    // совпадение с выбранной озвучкой — берём молча; иначе показываем выбор.
-    function chooseTrack(stream, preferred, callback) {
-      var list = stream.hlsSource || [];
-      if (list.length < 2) { callback(list[0] || null); return; }
-
-      var matched = findTrack(stream, preferred);
-      if (matched) { callback(matched); return; }
-
-      Lampa.Select.show({
-        title: 'Озвучка',
-        items: list.map(function (src, index) {
-          return { title: src.label || ('Дорожка ' + (index + 1)), index: index };
-        }),
-        onSelect: function (a) { callback(list[a.index]); },
-        onBack: function () {}
-      });
-    }
-
     function play(element, item) {
       try {
         if (DIAG) diag('play host=' + hostOf(element.url) + ' q=' + Object.keys(element.quality || {}).length);
@@ -763,11 +871,11 @@
     }
 
     // Фильм: озвучка выбирает физический файл (translation=), POST отдаёт его
-    // дорожки. Если дорожек несколько — chooseTrack подберёт нужную по названию
-    // озвучки, иначе спросит.
+    // дорожки. Поток обычно уже прогрет decorateCard; дорожку подбираем молча
+    // (pickTrack), без лишнего диалога выбора.
     function playMovieCard(item, hash) {
       withLoader(function (stopLoad) {
-        fetchStream(item.iframe, token).then(function (stream) {
+        resolveStream(item.iframe, token).then(function (stream) {
           stopLoad();
 
           if (!stream) {
@@ -775,15 +883,14 @@
             return;
           }
 
-          chooseTrack(stream, item.title, function (chosen) {
-            var element = toElement(stream, chosen, item, hash);
-            if (!element) {
-              Lampa.Noty.show('Нет ссылки на поток');
-              return;
-            }
+          var chosen = pickTrack(stream, item.title);
+          var element = toElement(stream, chosen, item, hash);
+          if (!element) {
+            Lampa.Noty.show('Нет ссылки на поток');
+            return;
+          }
 
-            play(element, item);
-          });
+          play(element, item);
         });
       });
     }
@@ -803,7 +910,7 @@
           poster: posterUrl(movieArtwork()),
           time: timeText(item.duration),
           timeline: hash,
-          info: item.sub || ''
+          info: ''
         });
 
         card.on('hover:enter', function () {
@@ -811,6 +918,7 @@
         });
 
         scroll.append(card);
+        decorateCard(card, item.iframe, item.title, true);
       });
 
       focusFirst();
@@ -912,6 +1020,10 @@
           info: quality
         });
 
+        card.on('hover:focus', function () {
+          decorateCard(card, episodeIframe(episode, serialVoice), serialVoice, false);
+        });
+
         card.on('hover:enter', function () {
           playEpisode({
             iframe: episodeIframe(episode, serialVoice),
@@ -931,26 +1043,25 @@
     // (ленивый резолв при переключении).
     function playEpisode(item, hash, playlist) {
       withLoader(function (stopLoad) {
-        fetchStream(item.iframe, token).then(function (stream) {
+        resolveStream(item.iframe, token).then(function (stream) {
           stopLoad();
           if (!stream) {
             Lampa.Noty.show('Нет ссылки на поток');
             return;
           }
 
-          chooseTrack(stream, item.voice, function (chosen) {
-            var element = toElement(stream, chosen, item, hash);
-            if (!element) {
-              Lampa.Noty.show('Нет ссылки на поток');
-              return;
-            }
+          var chosen = pickTrack(stream, item.voice);
+          var element = toElement(stream, chosen, item, hash);
+          if (!element) {
+            Lampa.Noty.show('Нет ссылки на поток');
+            return;
+          }
 
-            if (playlist && playlist.length > 1) {
-              element.playlist = buildPlaylist(playlist, item, element);
-            }
+          if (playlist && playlist.length > 1) {
+            element.playlist = buildPlaylist(playlist, item, element);
+          }
 
-            play(element, item);
-          });
+          play(element, item);
         });
       });
     }
@@ -981,7 +1092,7 @@
               }
 
               // Тихий выбор: в ленивом резолве диалог показывать нельзя.
-              var chosen = findTrack(stream, entry.voice) || stream.hlsSource[0];
+              var chosen = pickTrack(stream, entry.voice);
               var el = toElement(stream, chosen, entry, entry.hash);
               if (el) {
                 cell.url = el.url;
@@ -1233,6 +1344,7 @@
       '.alloha-card__loader{position:absolute;top:0;left:0;right:0;bottom:0;background:linear-gradient(90deg,rgba(255,255,255,.05),rgba(255,255,255,.13),rgba(255,255,255,.05));background-size:200% 100%;animation:alloha-shimmer 1.2s infinite}',
       '@keyframes alloha-shimmer{0%{background-position:200% 0}100%{background-position:-200% 0}}',
       '.alloha-card__sub{position:absolute;left:.3em;bottom:.3em;padding:.1em .45em;border-radius:.25em;background:rgba(0,0,0,.65);font-size:.8em;font-weight:600}',
+      '.alloha-card__sub.hide{display:none}',
       '.alloha-card__body{flex:1 1 auto;min-width:0}',
       '.alloha-card__head{display:flex;justify-content:space-between;gap:1em}',
       '.alloha-card__title{font-size:1.1em;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}',
@@ -1326,6 +1438,9 @@
       subsOf: subsOf,
       normalizeVoice: normalizeVoice,
       findTrack: findTrack,
+      pickTrack: pickTrack,
+      describeStream: describeStream,
+      maxQuality: maxQuality,
       movieVoices: movieVoices,
       serialModel: serialModel,
       timeToSeconds: timeToSeconds
