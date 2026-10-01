@@ -320,19 +320,63 @@
   // плейлисты уходят корректно, без ручного переписывания манифеста.
   var proxyIndex = 0;
 
-  function proxStream(url, origin) {
-    if (!url) return url;
-    if (Lampa.Platform.is('android')) return url;
-    if (isProxy(url)) return url;
-
-    var base = PROXIES[proxyIndex++ % PROXIES.length];
-    dbg('proxy', hostOf(base) + ' <- ' + shortUrl(url));
-
+  // URL медиа-хопа через конкретный прокси (param/... добавляют заголовки).
+  function mediaProxyUrl(base, url, origin) {
     return base +
       'param/Origin=' + encodeURIComponent(origin) + '/' +
       'param/Referer=' + encodeURIComponent(origin + '/') + '/' +
       'param/User-Agent=' + encodeURIComponent(UA) + '/' +
       url;
+  }
+
+  function proxStream(url, origin, base) {
+    if (!url) return url;
+    if (Lampa.Platform.is('android')) return url;
+    if (isProxy(url)) return url;
+
+    var proxy = base || PROXIES[proxyIndex++ % PROXIES.length];
+    if (base) dbg('proxy', 'locked ' + hostOf(proxy));
+
+    return mediaProxyUrl(proxy, url, origin);
+  }
+
+  // CDN Alloha блокирует часть IP (в т.ч. часть rte-нод) → медиа отдаёт 403.
+  // Перед выдачей потока проверяем прокси коротким запросом манифеста и
+  // закрепляем за потоком тот, что реально отвечает.
+  function probeProxy(base, url, origin) {
+    return new Promise(function (resolve) {
+      var network = new Lampa.Reguest();
+      network.timeout(7000);
+      network.silent(mediaProxyUrl(base, url, origin), function (data) {
+        resolve(!!data);
+      }, function () {
+        resolve(false);
+      }, false, {
+        dataType: 'text',
+        headers: { 'User-Agent': UA, Origin: origin, Referer: origin + '/' }
+      });
+    });
+  }
+
+  function chooseProxy(url, origin) {
+    if (!url || Lampa.Platform.is('android')) return Promise.resolve(null);
+
+    return new Promise(function (resolve) {
+      var i = 0;
+      (function next() {
+        if (i >= PROXIES.length) {
+          var fallback = PROXIES[proxyIndex++ % PROXIES.length];
+          dbg('proxy', 'нет рабочего прокси, беру ' + hostOf(fallback));
+          resolve(fallback);
+          return;
+        }
+        var base = PROXIES[i++];
+        probeProxy(base, url, origin).then(function (ok) {
+          if (ok) { dbg('proxy', 'выбран ' + hostOf(base)); resolve(base); }
+          else { dbg('proxy', hostOf(base) + ' FAIL'); next(); }
+        });
+      })();
+    });
   }
 
   // --- Сетевой слой (как в tu.js: прямой запрос, при неудаче — CORS-прокси) --
@@ -1174,9 +1218,9 @@
 
     // Превращаем результат bnsi в элемент плеера Lampa. entry — конкретная
     // озвучка из stream.hlsSource (выбранная или единственная).
-    function toElement(stream, entry, item, hash) {
+    function toElement(stream, entry, item, hash, proxyBase) {
       var dict = qualityDict(entry);
-      var url = proxStream(bestUrl(dict) || entry.url || null, stream.origin);
+      var url = proxStream(bestUrl(dict) || entry.url || null, stream.origin, proxyBase);
       if (!url) return null;
 
       var element = {
@@ -1205,18 +1249,27 @@
       if (nums.length) {
         // Меню качества Lampa тоже ходит на CDN — значения проксируем.
         var qdict = {};
-        nums.forEach(function (n) { qdict[n] = proxStream(dict[n], stream.origin); });
+        nums.forEach(function (n) { qdict[n] = proxStream(dict[n], stream.origin, proxyBase); });
         element.quality = qdict;
       }
 
       var subs = subsOf(stream.tracks);
       if (subs.length) {
         element.subtitles = subs.map(function (sub) {
-          return { label: sub.label, url: proxStream(sub.url, stream.origin), index: sub.index };
+          return { label: sub.label, url: proxStream(sub.url, stream.origin, proxyBase), index: sub.index };
         });
       }
 
       return element;
+    }
+
+    // Собрать элемент плеера: выбрать рабочий прокси и завернуть медиа.
+    function buildElement(stream, entry, item, hash) {
+      var dict = qualityDict(entry);
+      var mainUrl = bestUrl(dict) || entry.url || null;
+      return chooseProxy(mainUrl, stream.origin).then(function (base) {
+        return toElement(stream, entry, item, hash, base);
+      });
     }
 
     // Нативный лоадер Lampa на время сетевого резолва потока.
@@ -1320,23 +1373,24 @@
           if (!stream) { restarting = false; Lampa.Noty.show('Не удалось перезапустить поток'); return; }
 
           var chosen = pickTrack(stream, cp.pick);
-          var el = toElement(stream, chosen, cp.item, cp.hash);
-          if (!el) { restarting = false; Lampa.Noty.show('Не удалось перезапустить поток'); return; }
+          buildElement(stream, chosen, cp.item, cp.hash).then(function (el) {
+            if (!el) { restarting = false; Lampa.Noty.show('Не удалось перезапустить поток'); return; }
 
-          if (at && dur) {
-            el.timeline.time = at;
-            el.timeline.percent = Math.min(99, Math.round(at / dur * 100));
-            el.timeline.duration = dur;
-          }
+            if (at && dur) {
+              el.timeline.time = at;
+              el.timeline.percent = Math.min(99, Math.round(at / dur * 100));
+              el.timeline.duration = dur;
+            }
 
-          if (cp.playlist && cp.playlist.length > 1) {
-            el.playlist = buildPlaylist(cp.playlist, cp.item, el);
-          }
+            if (cp.playlist && cp.playlist.length > 1) {
+              el.playlist = buildPlaylist(cp.playlist, cp.item, el);
+            }
 
-          play(el, cp.item);
-          restarting = false;
-          lastPos = -1;
-          lastPosAt = Date.now();
+            play(el, cp.item);
+            restarting = false;
+            lastPos = -1;
+            lastPosAt = Date.now();
+          });
         });
       });
     }
@@ -1355,14 +1409,15 @@
           }
 
           var chosen = pickTrack(stream, item.title);
-          var element = toElement(stream, chosen, item, hash);
-          if (!element) {
-            Lampa.Noty.show('Нет ссылки на поток');
-            return;
-          }
+          buildElement(stream, chosen, item, hash).then(function (element) {
+            if (!element) {
+              Lampa.Noty.show('Нет ссылки на поток');
+              return;
+            }
 
-          beginWatch(item, hash, item.title, null);
-          play(element, item);
+            beginWatch(item, hash, item.title, null);
+            play(element, item);
+          });
         });
       });
     }
@@ -1549,18 +1604,19 @@
           }
 
           var chosen = pickTrack(stream, item.voice);
-          var element = toElement(stream, chosen, item, hash);
-          if (!element) {
-            Lampa.Noty.show('Нет ссылки на поток');
-            return;
-          }
+          buildElement(stream, chosen, item, hash).then(function (element) {
+            if (!element) {
+              Lampa.Noty.show('Нет ссылки на поток');
+              return;
+            }
 
-          if (playlist && playlist.length > 1) {
-            element.playlist = buildPlaylist(playlist, item, element);
-          }
+            if (playlist && playlist.length > 1) {
+              element.playlist = buildPlaylist(playlist, item, element);
+            }
 
-          beginWatch(item, hash, item.voice, playlist);
-          play(element, item);
+            beginWatch(item, hash, item.voice, playlist);
+            play(element, item);
+          });
         });
       });
     }
@@ -1592,19 +1648,20 @@
 
               // Тихий выбор: в ленивом резолве диалог показывать нельзя.
               var chosen = pickTrack(stream, entry.voice);
-              var el = toElement(stream, chosen, entry, entry.hash);
-              if (el) {
-                cell.url = el.url;
-                cell.headers = el.headers;
-                if (el.quality) cell.quality = el.quality;
-                if (el.subtitles) cell.subtitles = el.subtitles;
-                // Переключились на другую серию — сторож теперь ведёт её.
-                beginWatch(entry, entry.hash, entry.voice, entries);
-              } else {
-                cell.url = '';
-                Lampa.Noty.show('Нет ссылки на поток');
-              }
-              call();
+              buildElement(stream, chosen, entry, entry.hash).then(function (el) {
+                if (el) {
+                  cell.url = el.url;
+                  cell.headers = el.headers;
+                  if (el.quality) cell.quality = el.quality;
+                  if (el.subtitles) cell.subtitles = el.subtitles;
+                  // Переключились на другую серию — сторож теперь ведёт её.
+                  beginWatch(entry, entry.hash, entry.voice, entries);
+                } else {
+                  cell.url = '';
+                  Lampa.Noty.show('Нет ссылки на поток');
+                }
+                call();
+              });
             });
           };
         }
