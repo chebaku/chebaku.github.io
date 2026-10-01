@@ -208,7 +208,9 @@
               if (isMediaUrl(u)) {
                 if (st >= 200 && st < 400) { DBG.mediaOk++; DBG.lastMediaOk = Date.now(); }
                 else { DBG.mediaFail++; DBG.lastMediaFail = Date.now(); }
-                if (st === 403) notifyMedia403();
+                // На Tizen поток тянет AVPlay нативно, поэтому любой XHR-403 тут —
+                // это парсер hls.js или проба (оба нефатальны): не дёргаем сторож.
+                if (st === 403 && !probing && !Lampa.Platform.is('tizen')) notifyMedia403();
               }
               var important = st >= 400 || st === 0 ||
                 u.indexOf('.m3u8') !== -1 ||
@@ -236,7 +238,7 @@
             if (isMediaUrl(url)) {
               if (st >= 200 && st < 400) { DBG.mediaOk++; DBG.lastMediaOk = Date.now(); }
               else { DBG.mediaFail++; DBG.lastMediaFail = Date.now(); }
-              if (st === 403) notifyMedia403();
+              if (st === 403 && !probing && !Lampa.Platform.is('tizen')) notifyMedia403();
             }
             if (st >= 400) dbg('NET!', 'fetch ' + st + ' ' + (Date.now() - t0) + 'ms ' + shortUrl(url));
             else if (String(url).indexOf('.m3u8') !== -1) dbg('net', 'm3u8 ' + st + ' ' + (Date.now() - t0) + 'ms ' + shortUrl(url));
@@ -313,6 +315,9 @@
 
   // Активный обработчик 403 от медиа-CDN (ставит текущий компонент Alloha).
   var media403Handler = null;
+
+  // >0 пока идёт проба прокси — её 403 не должен считаться «смертью» потока.
+  var probing = 0;
   try {
     document.addEventListener('alloha-media-403', function () {
       if (media403Handler) media403Handler();
@@ -423,10 +428,12 @@
     return new Promise(function (resolve) {
       var network = new Lampa.Reguest();
       network.timeout(7000);
+      probing++;
+      var done = function (v) { probing--; if (probing < 0) probing = 0; resolve(v); };
       network.silent(mediaProxyUrl(base, url, origin), function (data) {
-        resolve(!!data);
+        done(!!data);
       }, function () {
-        resolve(false);
+        done(false);
       }, false, {
         dataType: 'text',
         headers: { 'User-Agent': UA, Origin: origin, Referer: origin + '/' }
@@ -1387,9 +1394,10 @@
     function play(element, item) {
       try {
         DBG.mediaOk = 0; DBG.mediaFail = 0; DBG.lastMediaOk = 0; DBG.lastMediaFail = 0;
+        var plat = (Lampa.Platform && Lampa.Platform.get) ? Lampa.Platform.get() : '?';
         dbg('play', 'host=' + hostOf(element.url) + ' q=' + Object.keys(element.quality || {}).length +
           ' subs=' + ((element.subtitles || []).length) + ' urlLen=' + String(element.url || '').length +
-          (tizenDirect() ? ' tizen=headers' : ''));
+          ' platform=' + plat + (tizenDirect() ? ' tizen=headers' : ''));
         dbgWatchVideo();
 
         if (tizenDirect()) {
@@ -1443,7 +1451,7 @@
       if (Date.now() - lastPosAt > STALL_MS) {
         lastPosAt = Date.now();
         dbg('watchdog', 'stall t=' + Math.round(v.currentTime) + 's -> restart');
-        restartStream();
+        restartStream('stall');
       }
     }
 
@@ -1453,10 +1461,10 @@
       if (Date.now() - restartCooldown < 15000) return;
       restartCooldown = Date.now();
       dbg('watchdog', 'media 403 -> restart');
-      restartStream();
+      restartStream('403');
     }
 
-    function restartStream() {
+    function restartStream(reason) {
       if (restarting || !currentPlay) return;
       restarting = true;
 
@@ -1468,11 +1476,12 @@
         dur = v ? (v.duration || 0) : 0;
       } catch (e) {}
 
-      // Прямой режим Tizen не поехал (поток так и не начался) — значит
-      // HTTP_HEADER не сработал: отключаем и уходим на прокси.
-      if (tizenDirect() && at < 5) {
+      // Прямой режим Tizen не поехал по НАСТОЯЩЕМУ стопу (поток так и не
+      // начался, currentTime ~0) — значит HTTP_HEADER не сработал: уходим на
+      // прокси. Откат только по 'stall', не по 403 (403 от парсера/проб — норма).
+      if (tizenDirect() && at < 5 && reason === 'stall') {
         TIZEN_HEADERS = false;
-        dbg('tizen', 'заголовки не сработали -> proxy');
+        dbg('tizen', 'прямой поток застопорился -> proxy');
       }
 
       withLoader(function (stopLoad) {
