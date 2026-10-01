@@ -34,19 +34,17 @@
 
   var preferProxy = false;
 
-  // --- ДИАГНОСТИКА: экранная консоль для ТВ -------------------------------
+  // --- ДИАГНОСТИКА --------------------------------------------------------
   //
-  // На телевизорах нет devtools, поэтому логи (сеть, резолв, события <video>)
-  // пишутся прямо поверх экрана в полупрозрачную панель. Также всё дублируется
-  // в console.log('ALLOHA', …).
-  //
-  // Управление:
-  //   window.alloha_dbg.on() / .off() / .clear() / .toggle()
+  // Логи (сеть, резолв, события <video>) идут в console.log('ALLOHA', …).
+  // Экранная панель выключена по умолчанию и интерфейс не перекрывает.
+  // При необходимости включить на сессию:
+  //   window.alloha_dbg.on() / .off() / .clear() / .lines()
   //   клавиша F2 (или keyCode 113) — переключить панель.
-  // Состояние хранится в Lampa.Storage('alloha_debug').
+  // Настройка не сохраняется: после перезапуска панель снова выключена.
 
   var DBG = {
-    on: true,
+    on: false,
     max: 160,
     lines: [],
     box: null,
@@ -96,12 +94,10 @@
     try { return (location.protocol || '') + '//' + (location.host || ''); } catch (e) { return 'n/a'; }
   }
 
+  // Экранная панель выключена по умолчанию (перекрывает интерфейс). Логи всегда
+  // идут в console.log('ALLOHA', …); панель можно включить вручную на сессию:
+  // window.alloha_dbg.on() / .off() / .clear() / .lines().
   function dbgEnabled() {
-    try {
-      var s = Lampa.Storage.get('alloha_debug', null);
-      if (s === '0' || s === 0 || s === false) return false;
-      if (s === '1' || s === 1 || s === true) return true;
-    } catch (e) {}
     return DBG.on;
   }
 
@@ -142,7 +138,6 @@
 
   function dbgSet(on) {
     DBG.on = !!on;
-    try { Lampa.Storage.set('alloha_debug', on ? '1' : '0'); } catch (e) {}
     if (!on && DBG.box) { DBG.box.remove(); DBG.box = null; DBG.body = null; }
     else if (on) { dbgEnsure(); dbgPaint(); }
   }
