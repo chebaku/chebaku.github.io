@@ -302,6 +302,53 @@
     });
   } catch (e) {}
 
+  // --- Tizen: прямой поток + заголовок Origin через AVPlay -----------------
+  //
+  // CDN требует Origin плеера. На Tizen Lampa вызывает webapis.avplay.open(url)
+  // без заголовков, а из JS Origin не выставить. Но AVPlay умеет
+  // setStreamingProperty('HTTP_HEADER', ...) — патчим open и подставляем
+  // Origin/Referer/User-Agent для нашей ссылки. Если прошивка не поддерживает —
+  // сторож отключит режим и уйдёт на прокси (см. restartStream).
+  var TIZEN_HEADERS = true;
+  var AVPLAY = { url: null, headers: null };
+
+  function tizenDirect() {
+    return TIZEN_HEADERS && Lampa.Platform.is('tizen');
+  }
+
+  function directPlatform() {
+    return Lampa.Platform.is('android') || tizenDirect();
+  }
+
+  function patchAvplay() {
+    try {
+      if (!(window.webapis && webapis.avplay) || webapis.avplay.__alPatched) return;
+      var open = webapis.avplay.open;
+      webapis.avplay.__alPatched = true;
+      webapis.avplay.open = function (url) {
+        var res = open.apply(this, arguments);
+        try {
+          if (AVPLAY.headers && AVPLAY.url && url === AVPLAY.url) {
+            webapis.avplay.setStreamingProperty('HTTP_HEADER', AVPLAY.headers);
+            dbg('tizen', 'HTTP_HEADER set (' + AVPLAY.headers.split('\r\n').length + ' hdr)');
+          }
+        } catch (e) {
+          dbg('tizen', 'HTTP_HEADER FAIL: ' + (e && e.message));
+        }
+        return res;
+      };
+    } catch (e) {}
+  }
+
+  function avplayHeaders(element) {
+    var h = (element && element.headers) || {};
+    var parts = [];
+    if (h.Origin) parts.push('Origin: ' + h.Origin);
+    if (h.Referer) parts.push('Referer: ' + h.Referer);
+    parts.push('User-Agent: ' + (h['User-Agent'] || UA));
+    return parts.join('\r\n');
+  }
+
   function isProxy(url) {
     return PROXIES.some(function (base) { return url.indexOf(base) === 0; });
   }
@@ -331,7 +378,7 @@
 
   function proxStream(url, origin, base) {
     if (!url) return url;
-    if (Lampa.Platform.is('android')) return url;
+    if (directPlatform()) return url;
     if (isProxy(url)) return url;
 
     var proxy = base || PROXIES[proxyIndex++ % PROXIES.length];
@@ -359,7 +406,7 @@
   }
 
   function chooseProxy(url, origin) {
-    if (!url || Lampa.Platform.is('android')) return Promise.resolve(null);
+    if (!url || directPlatform()) return Promise.resolve(null);
 
     return new Promise(function (resolve) {
       var i = 0;
@@ -956,7 +1003,6 @@
     // с текущей позиции (Lampa сама доигрывает по timeline).
     var watchdog = null;
     var currentPlay = null;      // { item, hash, pick, playlist }
-    var voicesList = null;       // список озвучек фильма (для фолбэка)
     var lastPos = -1;
     var lastPosAt = 0;
     var restarting = false;
@@ -1294,8 +1340,15 @@
       try {
         DBG.mediaOk = 0; DBG.mediaFail = 0; DBG.lastMediaOk = 0; DBG.lastMediaFail = 0;
         dbg('play', 'host=' + hostOf(element.url) + ' q=' + Object.keys(element.quality || {}).length +
-          ' subs=' + ((element.subtitles || []).length) + ' urlLen=' + String(element.url || '').length);
+          ' subs=' + ((element.subtitles || []).length) + ' urlLen=' + String(element.url || '').length +
+          (tizenDirect() ? ' tizen=headers' : ''));
         dbgWatchVideo();
+
+        if (tizenDirect()) {
+          patchAvplay();
+          AVPLAY.url = element.url;
+          AVPLAY.headers = avplayHeaders(element);
+        }
         markWatch(item);
         Lampa.Player.play(element);
         if (element.playlist) Lampa.Player.playlist(element.playlist);
@@ -1368,6 +1421,13 @@
         dur = v ? (v.duration || 0) : 0;
       } catch (e) {}
 
+      // Если прямой режим Tizen не поехал (поток так и не начался) — значит
+      // HTTP_HEADER не сработал: отключаем и уходим на прокси.
+      if (tizenDirect() && at < 5) {
+        TIZEN_HEADERS = false;
+        dbg('tizen', 'заголовки не сработали -> proxy');
+      }
+
       withLoader(function (stopLoad) {
         resolveStream(cp.item.iframe, token, 0).then(function (stream) {
           stopLoad();
@@ -1377,12 +1437,8 @@
           buildElement(stream, chosen, cp.item, cp.hash).then(function (el) {
             if (!el) {
               restarting = false;
-              dbg('fallback', 'перезапуск не удался (403)');
-              if (voicesList && voicesList.indexOf(cp.item) !== -1 && voicesList.length > 1) {
-                playVoicesFrom(cp.item, cp.hash);
-              } else {
-                Lampa.Noty.show('Не удалось перезапустить поток');
-              }
+              dbg('watchdog', 'перезапуск не удался (403)');
+              Lampa.Noty.show('Не удалось перезапустить поток');
               return;
             }
 
@@ -1405,38 +1461,16 @@
       });
     }
 
-    // Порядок озвучек от выбранной по кругу. Если edge озвучки блокирует
-    // rte (403), автоматически пробуем следующую — у другой озвучки обычно
-    // другой CDN-edge, который прокси обслуживает.
-    function playVoicesFrom(item, hash) {
-      var start = voicesList ? voicesList.indexOf(item) : -1;
-      if (start < 0) start = 0;
-      var order = voicesList
-        ? voicesList.slice(start).concat(voicesList.slice(0, start))
-        : [item];
-      tryVoice(order, 0, hash);
-    }
-
-    function tryVoice(list, index, hash) {
-      if (index >= list.length) {
-        Lampa.Noty.show('Поток недоступен: все озвучки отдают 403');
-        return;
-      }
-
-      var item = list[index];
+    // Фильм: играем ровно выбранную озвучку (никакого автоподбора).
+    function playMovieCard(item, hash) {
       withLoader(function (stopLoad) {
         resolveStream(item.iframe, token, PLAY_TTL).then(function (stream) {
           stopLoad();
-          if (!stream) { tryVoice(list, index + 1, hash); return; }
+          if (!stream) { Lampa.Noty.show('Нет ссылки на поток'); return; }
 
           var chosen = pickTrack(stream, item.title);
           buildElement(stream, chosen, item, hash).then(function (element) {
-            if (!element) {
-              dbg('fallback', 'озвучка недоступна: ' + item.title + ' -> следующая');
-              if (index > 0) Lampa.Noty.show('«' + list[index - 1].title + '» недоступна — включаю «' + item.title + '»');
-              tryVoice(list, index + 1, hash);
-              return;
-            }
+            if (!element) { Lampa.Noty.show('Нет ссылки на поток'); return; }
 
             beginWatch(item, hash, item.title, null);
             play(element, item);
@@ -1445,14 +1479,11 @@
       });
     }
 
-    function playMovieCard(item, hash) { playVoicesFrom(item, hash); }
-
     // --- Отрисовка: фильм (карточки = озвучки) ------------------------------
 
     function renderItems(list) {
       scroll.body().empty();
       last = false;
-      voicesList = list;
 
       var hash = timelineHash();
 
@@ -1988,6 +2019,7 @@
 
     injectStyles();
     dbgHookNet();
+    patchAvplay();
     if (dbgEnabled()) { dbgEnsure(); dbg('diag', 'plugin start ' + locInfo()); }
     Lampa.Component.add('alloha', Alloha);
 
