@@ -172,6 +172,22 @@
     return parts.reduce(function (acc, p) { return acc * 60 + p; }, 0);
   }
 
+  // Длительность Alloha: "01:00" = 1 ч 0 мин (H:MM), а не 60 секунд (MM:SS).
+  // Отсюда и бралось "00:01" на всех карточках.
+  function allohaDuration(text) {
+    var parts = String(text || '').split(':');
+    if (parts.length === 2) {
+      return (parseInt(parts[0], 10) || 0) * 3600 + (parseInt(parts[1], 10) || 0) * 60;
+    }
+    return timeToSeconds(text);
+  }
+
+  // "2019-07-26" -> "26.07.2019".
+  function dateText(value) {
+    var m = String(value || '').match(/^(\d{4})-(\d{2})-(\d{2})/);
+    return m ? m[3] + '.' + m[2] + '.' + m[1] : '';
+  }
+
   // --- Подпись Borth: sha256('fp|'+viewporti) + '|' + sign(viewporti) -------
 
   function sha256hex(msg) {
@@ -427,10 +443,11 @@
   // свой (§6.1 журнала). Поэтому карточки прогреваем в фоне: резолвим поток
   // заранее и обновляем подпись; кэш потом отдаёт поток по клику мгновенно.
 
-  var streamCache = {};
+  var streamCache = {};        // iframe -> { promise, time }  (time=0 пока идёт)
   var resolveActive = 0;
   var resolveQueue = [];
   var RESOLVE_MAX = 2;
+  var STREAM_TTL = 10 * 60 * 1000;
 
   function pumpResolve() {
     while (resolveActive < RESOLVE_MAX && resolveQueue.length) {
@@ -439,6 +456,7 @@
         fetchStream(job.iframe, job.token).then(function (stream) {
           resolveActive--;
           if (!stream) delete streamCache[job.iframe];
+          else job.rec.time = Date.now();
           job.resolve(stream);
           pumpResolve();
         }, function () {
@@ -451,19 +469,25 @@
     }
   }
 
-  // iframe -> Promise<stream>. Дублирующиеся запросы дедуплицируются кэшем,
-  // параллелизм ограничен RESOLVE_MAX, чтобы не завалить /bnsi пачкой.
+  // iframe -> Promise<stream>. Повторные запросы дедуплицируются, параллелизм
+  // ограничен RESOLVE_MAX, а готовый поток живёт STREAM_TTL — после этого
+  // перерезолвим, чтобы подписанный m3u8 не успел протухнуть.
   function resolveStream(iframe, token) {
     if (!iframe) return Promise.resolve(null);
-    if (streamCache[iframe]) return streamCache[iframe];
 
-    var p = new Promise(function (resolve) {
-      resolveQueue.push({ iframe: iframe, token: token, resolve: resolve });
+    var cached = streamCache[iframe];
+    if (cached) {
+      if (cached.time === 0 || Date.now() - cached.time < STREAM_TTL) return cached.promise;
+      delete streamCache[iframe];
+    }
+
+    var rec = { time: 0, promise: null };
+    rec.promise = new Promise(function (resolve) {
+      resolveQueue.push({ iframe: iframe, token: token, resolve: resolve, rec: rec });
       pumpResolve();
     });
-
-    streamCache[iframe] = p;
-    return p;
+    streamCache[iframe] = rec;
+    return rec.promise;
   }
 
   // Мягкий выбор дорожки физического файла: совпадение с выбранной озвучкой →
@@ -492,10 +516,6 @@
     return max;
   }
 
-  function cleanLabel(label) {
-    return String(label == null ? '' : label).replace(/^\([^)]*\)\s*/, '').trim();
-  }
-
   function qualityText(nums) {
     return (nums || []).map(function (n) { return n + 'p'; }).join(' / ');
   }
@@ -512,12 +532,7 @@
 
     var parts = [];
     if (nums.length) parts.push(qualityText(nums));
-
-    var subs = subsOf(stream.tracks);
-    if (subs.length) {
-      var labels = subs.map(function (s) { return cleanLabel(s.label); }).filter(Boolean);
-      parts.push('субтитры: ' + (labels.length ? labels.join(', ') : subs.length));
-    }
+    if (subsOf(stream.tracks).length) parts.push('Субтитры');
 
     return parts.join(' · ');
   }
@@ -600,6 +615,7 @@
     var serialVoice = null;
     var serialSeason = null;
     var token = null;
+    var metaTmdbId = null;
 
     this.create = function () {
       return this.render();
@@ -651,6 +667,68 @@
     function movieArtwork() {
       var movie = object.movie || {};
       return movie.backdrop_path || movie.poster_path || null;
+    }
+
+    // --- TMDB: названия/даты/кадры серий и длительность ---------------------
+    //
+    // Alloha не отдаёт названия серий и точную длительность — берём из TMDB по
+    // id_tmdb из метаданных api.alloha.tv (в замере 76479 для «Пацанов»).
+
+    function tmdbReady() {
+      return !!(Lampa.Api && Lampa.Api.sources && Lampa.Api.sources.tmdb &&
+                typeof Lampa.Api.sources.tmdb.get === 'function');
+    }
+
+    function tmdbId() {
+      if (metaTmdbId) return metaTmdbId;
+      var movie = object.movie || {};
+      return movie.tmdb_id || null;
+    }
+
+    var seasonMetaCache = {};
+
+    // Номер сезона -> { номер_серии: {name, air_date, runtime, still} }.
+    function seasonMeta(seasonNumber) {
+      if (!tmdbReady() || !tmdbId()) return Promise.resolve(null);
+      if (seasonMetaCache[seasonNumber]) return seasonMetaCache[seasonNumber];
+
+      var p = new Promise(function (resolve) {
+        try {
+          Lampa.Api.sources.tmdb.get('tv/' + tmdbId() + '/season/' + seasonNumber, {}, function (data) {
+            var map = {};
+            ((data && data.episodes) || []).forEach(function (ep) {
+              map[ep.episode_number] = {
+                name: ep.name || '',
+                air_date: ep.air_date || '',
+                runtime: ep.runtime || 0,
+                still: ep.still_path || ''
+              };
+            });
+            resolve(Object.keys(map).length ? map : null);
+          }, function () { resolve(null); });
+        } catch (e) { resolve(null); }
+      });
+
+      p.then(function (map) { if (!map) delete seasonMetaCache[seasonNumber]; });
+      seasonMetaCache[seasonNumber] = p;
+      return p;
+    }
+
+    var movieRuntimeCache = null;
+
+    // Рантайм фильма (секунды) из TMDB; 0 — неизвестно.
+    function movieRuntime() {
+      if (movieRuntimeCache !== null) return Promise.resolve(movieRuntimeCache);
+      if (!tmdbReady() || !tmdbId()) return Promise.resolve(0);
+
+      return new Promise(function (resolve) {
+        try {
+          Lampa.Api.sources.tmdb.get('movie/' + tmdbId(), {}, function (data) {
+            movieRuntimeCache = ((data && data.runtime) || 0) * 60;
+            resolve(movieRuntimeCache);
+          }, function () { resolve(0); });
+        } catch (e) { resolve(0); }
+      });
     }
 
     function timeText(seconds) {
@@ -720,7 +798,7 @@
           '<div class="alloha-card__body">' +
             '<div class="alloha-card__head">' +
               '<div class="alloha-card__title">' + escapeHtml(fields.title) + '</div>' +
-              (fields.time ? '<div class="alloha-card__time">' + escapeHtml(fields.time) + '</div>' : '') +
+              '<div class="alloha-card__time' + (fields.time ? '' : ' hide') + '">' + escapeHtml(fields.time || '') + '</div>' +
             '</div>' +
             (fields.timeline ? '<div class="alloha-card__timeline"></div>' : '') +
             '<div class="alloha-card__info">' + escapeHtml(fields.info || '') + '</div>' +
@@ -995,48 +1073,74 @@
       last = false;
 
       var episodeList = episodesForVoice(season, serialVoice);
-      var playlist = episodeList.map(function (episode) {
-        return {
-          iframe: episodeIframe(episode, serialVoice),
-          voice: serialVoice,
-          hash: timelineHash(season.number, episode.number),
-          sub: 'S' + season.number + ' E' + episode.number,
-          season: season.number,
-          episode: episode.number,
-          poster: posterUrl(movieArtwork())
-        };
-      });
+      var playlist = [];
+      var cards = {};
 
       episodeList.forEach(function (episode) {
         var hash = timelineHash(season.number, episode.number);
-        var quality = (episode.translation[serialVoice] || {}).quality || '';
+        var sub = 'S' + season.number + ' E' + episode.number;
+
+        var entry = {
+          iframe: episodeIframe(episode, serialVoice),
+          voice: serialVoice,
+          hash: hash,
+          sub: sub,
+          name: '',
+          season: season.number,
+          episode: episode.number,
+          poster: posterUrl(movieArtwork()),
+          duration: 0
+        };
+        playlist.push(entry);
 
         var card = makeCard({
           title: 'Серия ' + episode.number,
-          sub: 'S' + season.number + ' E' + episode.number,
-          poster: posterUrl(movieArtwork()),
+          sub: sub,
+          poster: entry.poster,
           time: '',
           timeline: hash,
-          info: quality
+          info: ''
         });
-
-        card.on('hover:focus', function () {
-          decorateCard(card, episodeIframe(episode, serialVoice), serialVoice, false);
-        });
+        cards[episode.number] = card;
 
         card.on('hover:enter', function () {
-          playEpisode({
-            iframe: episodeIframe(episode, serialVoice),
-            voice: serialVoice,
-            season: season.number,
-            episode: episode.number
-          }, hash, playlist);
+          playEpisode(entry, hash, playlist);
         });
 
         scroll.append(card);
       });
 
       focusFirst();
+
+      // Название, дата выхода, длительность и кадр серии — из TMDB.
+      seasonMeta(season.number).then(function (meta) {
+        if (!meta) return;
+
+        playlist.forEach(function (entry) {
+          var info = meta[entry.episode];
+          if (!info) return;
+
+          var card = cards[entry.episode];
+          var art = info.still ? posterUrl(info.still) : null;
+
+          if (info.name) card.find('.alloha-card__title').text(info.name);
+
+          var date = dateText(info.air_date);
+          if (date) card.find('.alloha-card__info').text(date);
+          if (info.runtime) {
+            card.find('.alloha-card__time').removeClass('hide').text(timeText(info.runtime * 60));
+          }
+
+          if (art) {
+            entry.poster = art;
+            var img = card.find('img')[0];
+            if (img) img.src = art;
+          }
+
+          entry.name = info.name || '';
+          entry.duration = info.runtime ? info.runtime * 60 : 0;
+        });
+      });
     }
 
     // Серия: соседние серии текущего сезона уходят в нативный плейлист
@@ -1069,7 +1173,7 @@
     function buildPlaylist(entries, currentItem, currentElement) {
       return entries.map(function (entry) {
         var cell = {
-          title: entry.sub,
+          title: entry.name || entry.sub,
           season: entry.season,
           episode: entry.episode,
           timeline: Lampa.Timeline.view(entry.hash),
@@ -1083,7 +1187,7 @@
           if (currentElement.subtitles) cell.subtitles = currentElement.subtitles;
         } else {
           cell.url = function (call) {
-            fetchStream(entry.iframe, token).then(function (stream) {
+            resolveStream(entry.iframe, token).then(function (stream) {
               if (!stream) {
                 cell.url = '';
                 Lampa.Noty.show('Нет ссылки на поток');
@@ -1254,6 +1358,8 @@
               return;
             }
 
+            metaTmdbId = meta.id_tmdb || null;
+
             var isSerial = !!meta.seasons && Object.keys(meta.seasons).length > 0;
 
             if (isSerial) {
@@ -1274,7 +1380,7 @@
               return;
             }
 
-            var duration = timeToSeconds(meta.time);
+            var duration = allohaDuration(meta.time);
             voices.forEach(function (item) {
               item.duration = duration;
               item.poster = meta.poster || null;
@@ -1282,6 +1388,13 @@
 
             loadDone();
             renderItems(voices);
+
+            // Длительность уточняем из TMDB (Alloha даёт только H:MM).
+            movieRuntime().then(function (sec) {
+              if (!sec) return;
+              voices.forEach(function (item) { item.duration = sec; });
+              scroll.body().find('.alloha-card__time').removeClass('hide').text(timeText(sec));
+            });
           });
         });
       });
@@ -1345,6 +1458,7 @@
       '@keyframes alloha-shimmer{0%{background-position:200% 0}100%{background-position:-200% 0}}',
       '.alloha-card__sub{position:absolute;left:.3em;bottom:.3em;padding:.1em .45em;border-radius:.25em;background:rgba(0,0,0,.65);font-size:.8em;font-weight:600}',
       '.alloha-card__sub.hide{display:none}',
+      '.alloha-card__time.hide{display:none}',
       '.alloha-card__body{flex:1 1 auto;min-width:0}',
       '.alloha-card__head{display:flex;justify-content:space-between;gap:1em}',
       '.alloha-card__title{font-size:1.1em;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}',
@@ -1443,7 +1557,9 @@
       maxQuality: maxQuality,
       movieVoices: movieVoices,
       serialModel: serialModel,
-      timeToSeconds: timeToSeconds
+      timeToSeconds: timeToSeconds,
+      allohaDuration: allohaDuration,
+      dateText: dateText
     };
   }
 
