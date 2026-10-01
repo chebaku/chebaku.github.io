@@ -16,7 +16,11 @@
   var API_PLAYERS = 'https://p.linkpp.ink/api/players?kinopoisk=';
   var EXTERNALIDS_URL = 'https://akter-black.com/externalids';
   var ALLOHA_API = 'https://api.alloha.tv/';
+  // ext.rte.net.ru:8443 — отдельный rte-прокси с egress в другой ASN (не
+  // Timeweb), поэтому обслуживает UHD-edge, который режет Timeweb. Ставим
+  // первым; узлы proxy4..7 — фолбэк.
   var PROXIES = [
+    'https://ext.rte.net.ru:8443/',
     'https://proxy4.rte.net.ru/',
     'https://proxy5.rte.net.ru/',
     'https://proxy6.rte.net.ru/',
@@ -302,53 +306,6 @@
     });
   } catch (e) {}
 
-  // --- Tizen: прямой поток + заголовок Origin через AVPlay -----------------
-  //
-  // CDN требует Origin плеера. На Tizen Lampa вызывает webapis.avplay.open(url)
-  // без заголовков, а из JS Origin не выставить. Но AVPlay умеет
-  // setStreamingProperty('HTTP_HEADER', ...) — патчим open и подставляем
-  // Origin/Referer/User-Agent для нашей ссылки. Если прошивка не поддерживает —
-  // сторож отключит режим и уйдёт на прокси (см. restartStream).
-  var TIZEN_HEADERS = true;
-  var AVPLAY = { url: null, headers: null };
-
-  function tizenDirect() {
-    return TIZEN_HEADERS && Lampa.Platform.is('tizen');
-  }
-
-  function directPlatform() {
-    return Lampa.Platform.is('android') || tizenDirect();
-  }
-
-  function patchAvplay() {
-    try {
-      if (!(window.webapis && webapis.avplay) || webapis.avplay.__alPatched) return;
-      var open = webapis.avplay.open;
-      webapis.avplay.__alPatched = true;
-      webapis.avplay.open = function (url) {
-        var res = open.apply(this, arguments);
-        try {
-          if (AVPLAY.headers && AVPLAY.url && url === AVPLAY.url) {
-            webapis.avplay.setStreamingProperty('HTTP_HEADER', AVPLAY.headers);
-            dbg('tizen', 'HTTP_HEADER set (' + AVPLAY.headers.split('\r\n').length + ' hdr)');
-          }
-        } catch (e) {
-          dbg('tizen', 'HTTP_HEADER FAIL: ' + (e && e.message));
-        }
-        return res;
-      };
-    } catch (e) {}
-  }
-
-  function avplayHeaders(element) {
-    var h = (element && element.headers) || {};
-    var parts = [];
-    if (h.Origin) parts.push('Origin: ' + h.Origin);
-    if (h.Referer) parts.push('Referer: ' + h.Referer);
-    parts.push('User-Agent: ' + (h['User-Agent'] || UA));
-    return parts.join('\r\n');
-  }
-
   function isProxy(url) {
     return PROXIES.some(function (base) { return url.indexOf(base) === 0; });
   }
@@ -378,7 +335,7 @@
 
   function proxStream(url, origin, base) {
     if (!url) return url;
-    if (directPlatform()) return url;
+    if (Lampa.Platform.is('android')) return url;
     if (isProxy(url)) return url;
 
     var proxy = base || PROXIES[proxyIndex++ % PROXIES.length];
@@ -406,7 +363,7 @@
   }
 
   function chooseProxy(url, origin) {
-    if (!url || directPlatform()) return Promise.resolve(null);
+    if (!url || Lampa.Platform.is('android')) return Promise.resolve(null);
 
     return new Promise(function (resolve) {
       var i = 0;
@@ -1340,15 +1297,8 @@
       try {
         DBG.mediaOk = 0; DBG.mediaFail = 0; DBG.lastMediaOk = 0; DBG.lastMediaFail = 0;
         dbg('play', 'host=' + hostOf(element.url) + ' q=' + Object.keys(element.quality || {}).length +
-          ' subs=' + ((element.subtitles || []).length) + ' urlLen=' + String(element.url || '').length +
-          (tizenDirect() ? ' tizen=headers' : ''));
+          ' subs=' + ((element.subtitles || []).length) + ' urlLen=' + String(element.url || '').length);
         dbgWatchVideo();
-
-        if (tizenDirect()) {
-          patchAvplay();
-          AVPLAY.url = element.url;
-          AVPLAY.headers = avplayHeaders(element);
-        }
         markWatch(item);
         Lampa.Player.play(element);
         if (element.playlist) Lampa.Player.playlist(element.playlist);
@@ -1420,13 +1370,6 @@
         at = v ? v.currentTime : 0;
         dur = v ? (v.duration || 0) : 0;
       } catch (e) {}
-
-      // Если прямой режим Tizen не поехал (поток так и не начался) — значит
-      // HTTP_HEADER не сработал: отключаем и уходим на прокси.
-      if (tizenDirect() && at < 5) {
-        TIZEN_HEADERS = false;
-        dbg('tizen', 'заголовки не сработали -> proxy');
-      }
 
       withLoader(function (stopLoad) {
         resolveStream(cp.item.iframe, token, 0).then(function (stream) {
@@ -2019,7 +1962,6 @@
 
     injectStyles();
     dbgHookNet();
-    patchAvplay();
     if (dbgEnabled()) { dbgEnsure(); dbg('diag', 'plugin start ' + locInfo()); }
     Lampa.Component.add('alloha', Alloha);
 
