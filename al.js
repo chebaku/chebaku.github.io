@@ -181,6 +181,17 @@
 
   // --- Хуки: сеть и <video> ----------------------------------------------
 
+  // Выжимка тела ответа для диагностики 403 на ТВ: размер + начало.
+  // 146b = гейт CDN/бан egress, 548b = WAF rte, 0b = CORS/сеть.
+  function bodyInfo(x) {
+    try {
+      if (x.responseType && x.responseType !== 'text') return '';
+      var t = x.responseText;
+      if (t == null) return '';
+      return ' [' + t.length + 'b: ' + String(t).replace(/\s+/g, ' ').slice(0, 64) + ']';
+    } catch (e) { return ''; }
+  }
+
   function dbgHookNet() {
     try {
       if (window.XMLHttpRequest && !XMLHttpRequest.__alHooked) {
@@ -203,8 +214,9 @@
                 u.indexOf('.m3u8') !== -1 ||
                 String(x.__alM || '').toUpperCase() === 'POST';
               if (important) {
+                var info = (isMediaUrl(u) && (st >= 400 || st === 0)) ? bodyInfo(x) : '';
                 dbg(st >= 400 || st === 0 ? 'NET!' : 'net',
-                  (x.__alM || 'GET') + ' ' + st + ' ' + (Date.now() - t0) + 'ms ' + shortUrl(u));
+                  (x.__alM || 'GET') + ' ' + st + ' ' + (Date.now() - t0) + 'ms ' + shortUrl(u) + info);
               }
             });
           } catch (e) {}
@@ -349,7 +361,7 @@
   // CDN Alloha блокирует часть IP (в т.ч. часть rte-нод) → медиа отдаёт 403.
   // Перед выдачей потока проверяем прокси коротким запросом манифеста и
   // закрепляем за потоком тот, что реально отвечает.
-  function probeProxy(base, url, origin) {
+  function probeOnce(base, url, origin) {
     return new Promise(function (resolve) {
       var network = new Lampa.Reguest();
       network.timeout(7000);
@@ -364,6 +376,22 @@
     });
   }
 
+  // Общий egress у ext/rte периодически режет CDN: одиночный 403 не приговор,
+  // следующая попытка часто проходит. Пробуем узел до PROBE_TRIES раз; успех —
+  // при первой удачной попытке.
+  var PROBE_TRIES = 3;
+  var PROBE_DELAY = 400;
+
+  function probeProxy(base, url, origin, tries) {
+    var left = tries == null ? PROBE_TRIES : tries;
+    return probeOnce(base, url, origin).then(function (ok) {
+      if (ok) return true;
+      if (left <= 1) return false;
+      return new Promise(function (r) { setTimeout(r, PROBE_DELAY); })
+        .then(function () { return probeProxy(base, url, origin, left - 1); });
+    });
+  }
+
   function chooseProxy(url, origin) {
     if (!url || Lampa.Platform.is('android')) return Promise.resolve(null);
 
@@ -371,8 +399,11 @@
       var i = 0;
       (function next() {
         if (i >= MEDIA_PROXIES.length) {
-          dbg('proxy', 'нет рабочего прокси (все узлы 403)');
-          resolve(false);
+          // Все пробы упали: чаще всего это кратковременный бан общего egress.
+          // Не отдаём «мёртвый» false (это блокировало воспроизведение) — играем
+          // через первый узел (ext) без пробы, а сторож перезапустит по 403.
+          dbg('proxy', 'все пробы 403 → играю через ' + hostOf(MEDIA_PROXIES[0]) + ' без пробы');
+          resolve(MEDIA_PROXIES[0]);
           return;
         }
         var base = MEDIA_PROXIES[i++];
