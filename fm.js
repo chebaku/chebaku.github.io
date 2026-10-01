@@ -620,21 +620,42 @@
 
     // Разбор post — buildModel на уровне модуля (см. ниже).
 
-    function loadPost(id) {
+    function openPost(id, post) {
       postId = id;
-      withLoader(function (stopLoad) {
-        apiGet('post/' + id).then(function (post) {
-          stopLoad();
-          if (!post) { status('Filmix API недоступен'); return; }
-          var pl = (post && post.player_links) || {};
-          log('post', id, 'movie=', pl.movie ? Object.keys(pl.movie).length : 0,
-            'playlist=', pl.playlist ? Object.keys(pl.playlist).length : 0);
-          var model = buildModel(post);
-          if (!model) { status('Нет доступных дорожек'); return; }
-          if (model.movies) { renderMovies(model.movies); return; }
-          startSerial(model);
+      var pl = (post && post.player_links) || {};
+      log('post', id, 'movie=', pl.movie ? Object.keys(pl.movie).length : 0,
+        'playlist=', pl.playlist ? Object.keys(pl.playlist).length : 0);
+
+      var model = buildModel(post);
+      if (!model) return false;
+      if (model.movies) { renderMovies(model.movies); return true; }
+      startSerial(model);
+      return true;
+    }
+
+    // Перебираем кандидатов, пока у кого-то не окажется дорожек.
+    function loadPost(cards) {
+      var i = 0;
+      var gotAny = false;
+
+      function next() {
+        if (i >= cards.length) {
+          status(gotAny ? 'Нет доступных дорожек' : 'Filmix API недоступен');
+          return;
+        }
+
+        var id = cards[i++].id;
+        withLoader(function (stopLoad) {
+          apiGet('post/' + id).then(function (post) {
+            stopLoad();
+            if (post) gotAny = true;
+            if (post && openPost(id, post)) return;
+            next();
+          });
         });
-      });
+      }
+
+      next();
     }
 
     // --- Поиск ---
@@ -680,16 +701,18 @@
       log('search', titles.join(' | '), '->', list.length, 'best=', scored[0] && scored[0].c.title, scored[0] && scored[0].s);
 
       if (scored.length && scored[0].s >= 2 && (!scored[1] || scored[0].s > scored[1].s)) {
-        loadPost(scored[0].c.id);
+        loadPost([scored[0].c]);
         return;
       }
 
+      var ordered = scored.map(function (x) { return x.c; });
+
       Lampa.Select.show({
         title: 'Filmix: выберите',
-        items: list.slice(0, 20).map(function (c, i) {
+        items: ordered.slice(0, 20).map(function (c, i) {
           return { title: c.title + (c.year ? ' (' + c.year + ')' : ''), index: i };
         }),
-        onSelect: function (a) { loadPost(list[a.index].id); },
+        onSelect: function (a) { loadPost(ordered.slice(a.index).concat(ordered.slice(0, a.index))); },
         onBack: function () {}
       });
     }
