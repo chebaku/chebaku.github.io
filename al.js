@@ -825,7 +825,9 @@
       if (fields.timeline) {
         try {
           var tl = typeof fields.timeline === 'object' ? fields.timeline : Lampa.Timeline.view(fields.timeline);
-          html.find('.alloha-card__timeline').append(Lampa.Timeline.render(tl));
+          // render() прячет трек при percent=0; снимаем hide, чтобы пустая
+          // полоса прогресса была видна и на несмотренных карточках.
+          html.find('.alloha-card__timeline').append(Lampa.Timeline.render(tl).removeClass('hide'));
         } catch (e) {}
       }
 
