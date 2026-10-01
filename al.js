@@ -34,21 +34,231 @@
 
   var preferProxy = false;
 
-  // --- ДИАГНОСТИКА (временно, для TV) -------------------------------------
-  var DIAG = false;
+  // --- ДИАГНОСТИКА: экранная консоль для ТВ -------------------------------
+  //
+  // На телевизорах нет devtools, поэтому логи (сеть, резолв, события <video>)
+  // пишутся прямо поверх экрана в полупрозрачную панель. Также всё дублируется
+  // в console.log('ALLOHA', …).
+  //
+  // Управление:
+  //   window.alloha_dbg.on() / .off() / .clear() / .toggle()
+  //   клавиша F2 (или keyCode 113) — переключить панель.
+  // Состояние хранится в Lampa.Storage('alloha_debug').
+
+  var DBG = {
+    on: true,
+    max: 160,
+    lines: [],
+    box: null,
+    body: null,
+    style: false,
+    paint: null,
+    videoTimer: 0,
+    lastSample: 0
+  };
 
   function hostOf(url) {
     try { return new URL(url).host; } catch (e) { return String(url || '').slice(0, 40); }
+  }
+
+  function shortUrl(url) {
+    var s = String(url || '');
+    return hostOf(s) + s.replace(/^[a-z]+:\/\/[^/]+/i, '').slice(0, 72);
   }
 
   function locInfo() {
     try { return (location.protocol || '') + '//' + (location.host || ''); } catch (e) { return 'n/a'; }
   }
 
-  function diag(msg) {
-    try { console.log('ALLOHA-DIAG', msg); } catch (e) {}
-    try { Lampa.Noty.show('ALLOHA: ' + msg); } catch (e) {}
+  function dbgEnabled() {
+    try {
+      var s = Lampa.Storage.get('alloha_debug', null);
+      if (s === '0' || s === 0 || s === false) return false;
+      if (s === '1' || s === 1 || s === true) return true;
+    } catch (e) {}
+    return DBG.on;
   }
+
+  function dbgInstallStyle() {
+    if (DBG.style) return;
+    DBG.style = true;
+    try {
+      $('head').append(
+        '<style>' +
+        '.alloha-dbg{position:fixed;left:8px;bottom:8px;width:48%;max-height:54%;z-index:2147483000;' +
+        'background:rgba(0,0,0,.72);color:#8ef;font:12px/1.35 monospace;border:1px solid rgba(120,200,255,.35);' +
+        'border-radius:8px;overflow:hidden;pointer-events:none}' +
+        '.alloha-dbg__bar{display:flex;justify-content:space-between;padding:3px 8px;background:rgba(20,60,90,.85);' +
+        'color:#cfe;font-weight:700}' +
+        '.alloha-dbg__x{pointer-events:auto;cursor:pointer;padding:0 4px}' +
+        '.alloha-dbg__body{padding:4px 8px;overflow:hidden;white-space:pre-wrap;word-break:break-all}' +
+        '</style>'
+      );
+    } catch (e) {}
+  }
+
+  function dbgEnsure() {
+    if (DBG.box && DBG.box.parent && DBG.box.parent().length) return true;
+    if (!$ || !document.body) return false;
+    dbgInstallStyle();
+    DBG.box = $(
+      '<div class="alloha-dbg">' +
+        '<div class="alloha-dbg__bar"><span>ALLOHA DEBUG (F2)</span>' +
+        '<span class="alloha-dbg__x">выкл</span></div>' +
+        '<div class="alloha-dbg__body"></div>' +
+      '</div>'
+    );
+    DBG.body = DBG.box.find('.alloha-dbg__body');
+    DBG.box.find('.alloha-dbg__x').on('click', function () { dbgSet(false); });
+    $('body').append(DBG.box);
+    return true;
+  }
+
+  function dbgSet(on) {
+    DBG.on = !!on;
+    try { Lampa.Storage.set('alloha_debug', on ? '1' : '0'); } catch (e) {}
+    if (!on && DBG.box) { DBG.box.remove(); DBG.box = null; DBG.body = null; }
+    else if (on) { dbgEnsure(); dbgPaint(); }
+  }
+
+  function dbgPaint() {
+    if (!dbgEnabled()) return;
+    if (DBG.paint) return;
+    DBG.paint = setTimeout(function () {
+      DBG.paint = null;
+      if (!dbgEnsure()) return;
+      DBG.body.text(DBG.lines.join('\n'));
+      try { DBG.body.scrollTop(DBG.body[0].scrollHeight); } catch (e) {}
+    }, 120);
+  }
+
+  function dbgClear() { DBG.lines = []; dbgPaint(); }
+
+  function clockText() {
+    try {
+      var d = new Date();
+      return ('0' + d.getHours()).slice(-2) + ':' + ('0' + d.getMinutes()).slice(-2) +
+             ':' + ('0' + d.getSeconds()).slice(-2);
+    } catch (e) { return ''; }
+  }
+
+  function dbg(tag, msg) {
+    try { console.log('ALLOHA', tag, msg); } catch (e) {}
+    if (!dbgEnabled()) return;
+    DBG.lines.push(clockText() + ' [' + tag + '] ' + msg);
+    if (DBG.lines.length > DBG.max) DBG.lines.shift();
+    dbgPaint();
+  }
+
+  function diag(msg) { dbg('diag', msg); }
+
+  // --- Хуки: сеть и <video> ----------------------------------------------
+
+  function dbgHookNet() {
+    try {
+      if (window.XMLHttpRequest && !XMLHttpRequest.__alHooked) {
+        XMLHttpRequest.__alHooked = true;
+        var open = XMLHttpRequest.prototype.open;
+        var send = XMLHttpRequest.prototype.send;
+        XMLHttpRequest.prototype.open = function (m, u) { this.__alM = m; this.__alU = u; return open.apply(this, arguments); };
+        XMLHttpRequest.prototype.send = function () {
+          var x = this, t0 = Date.now();
+          try {
+            x.addEventListener('loadend', function () {
+              var st = x.status || 0;
+              var important = st >= 400 || st === 0 ||
+                String(x.__alU || '').indexOf('.m3u8') !== -1 ||
+                String(x.__alM || '').toUpperCase() === 'POST';
+              if (important) {
+                dbg(st >= 400 || st === 0 ? 'NET!' : 'net',
+                  (x.__alM || 'GET') + ' ' + st + ' ' + (Date.now() - t0) + 'ms ' + shortUrl(x.__alU));
+              }
+            });
+          } catch (e) {}
+          return send.apply(this, arguments);
+        };
+      }
+    } catch (e) {}
+
+    try {
+      if (window.fetch && !window.fetch.__alHooked) {
+        var origFetch = window.fetch;
+        var wrapped = function (input) {
+          var url = (input && input.url) ? input.url : String(input);
+          var t0 = Date.now();
+          return origFetch.apply(this, arguments).then(function (res) {
+            var st = (res && res.status) || 0;
+            if (st >= 400) dbg('NET!', 'fetch ' + st + ' ' + (Date.now() - t0) + 'ms ' + shortUrl(url));
+            else if (String(url).indexOf('.m3u8') !== -1) dbg('net', 'm3u8 ' + st + ' ' + (Date.now() - t0) + 'ms ' + shortUrl(url));
+            return res;
+          }, function (err) {
+            dbg('NET!', 'fetch FAIL ' + (Date.now() - t0) + 'ms ' + shortUrl(url) + ' ' + (err && err.message || ''));
+            throw err;
+          });
+        };
+        wrapped.__alHooked = true;
+        window.fetch = wrapped;
+      }
+    } catch (e) {}
+  }
+
+  function dbgWatchVideo() {
+    if (DBG.videoTimer) return;
+    var misses = 0;
+    DBG.videoTimer = setInterval(function () {
+      var v = null;
+      try { v = document.querySelector('video'); } catch (e) {}
+
+      if (!v) {
+        if (++misses > 8) { clearInterval(DBG.videoTimer); DBG.videoTimer = 0; }
+        return;
+      }
+      misses = 0;
+
+      if (!v.__alDbg) {
+        v.__alDbg = true;
+        dbg('vid', 'attach src=' + shortUrl(v.currentSrc || v.src));
+        ['loadedmetadata', 'canplay', 'playing', 'waiting', 'stalled', 'error', 'ended', 'seeking', 'seeked', 'emptied', 'pause'].forEach(function (ev) {
+          v.addEventListener(ev, function () {
+            var buf = 0, end = 0;
+            try { if (v.buffered.length) { end = v.buffered.end(v.buffered.length - 1); buf = end - v.currentTime; } } catch (e) {}
+            var bad = ev === 'stalled' || ev === 'error' || ev === 'emptied';
+            dbg(bad ? 'VID!' : 'vid',
+              ev + ' t=' + Math.round(v.currentTime) + ' end=' + Math.round(end) + ' buf=' + Math.round(buf) + 's' +
+              ' rs=' + v.readyState + ' ns=' + v.networkState + (v.error ? ' ERR=' + v.error.code : ''));
+          });
+        });
+      }
+
+      var now = Date.now();
+      if (now - DBG.lastSample > 5000) {
+        DBG.lastSample = now;
+        var buf2 = 0, end2 = 0;
+        try { if (v.buffered.length) { end2 = v.buffered.end(v.buffered.length - 1); buf2 = end2 - v.currentTime; } } catch (e) {}
+        dbg('tick', 't=' + Math.round(v.currentTime) + ' end=' + Math.round(end2) + ' buf=' + Math.round(buf2) +
+          's rs=' + v.readyState + ' ns=' + v.networkState);
+      }
+    }, 1500);
+  }
+
+  function dbgKeys(e) {
+    var k = (e && (e.key || '')) || '';
+    if (k === 'F2' || (e && e.keyCode === 113)) {
+      var on = !dbgEnabled();
+      dbgSet(on);
+      dbg('diag', 'debug ' + (on ? 'ON' : 'OFF'));
+    }
+  }
+
+  try { document.addEventListener('keydown', dbgKeys, true); } catch (e) {}
+
+  window.alloha_dbg = {
+    on: function () { dbgSet(true); dbg('diag', 'manual ON'); },
+    off: function () { dbgSet(false); },
+    toggle: function () { var on = !dbgEnabled(); dbgSet(on); dbg('diag', 'debug ' + (on ? 'ON' : 'OFF')); },
+    clear: dbgClear,
+    lines: function () { return DBG.lines.slice(); }
+  };
 
   function isProxy(url) {
     return PROXIES.some(function (base) { return url.indexOf(base) === 0; });
@@ -74,6 +284,7 @@
     if (isProxy(url)) return url;
 
     var base = PROXIES[proxyIndex++ % PROXIES.length];
+    dbg('proxy', hostOf(base) + ' <- ' + shortUrl(url));
 
     return base +
       'param/Origin=' + encodeURIComponent(origin) + '/' +
@@ -83,6 +294,21 @@
   }
 
   // --- Сетевой слой (как в tu.js: прямой запрос, при неудаче — CORS-прокси) --
+
+  // Гарантирует, что промис завершится не позже ms (иначе resolve(null)).
+  // Нужно из-за возможных зависаний нативной сети на ТВ: один «зависший» слот
+  // резолвера иначе держит очередь и блокирует все следующие запуски.
+  function withTimeout(promise, ms) {
+    return new Promise(function (resolve) {
+      var done = false;
+      var timer = setTimeout(function () { if (!done) { done = true; resolve(null); } }, ms);
+      promise.then(function (value) {
+        if (done) return; done = true; clearTimeout(timer); resolve(value);
+      }, function () {
+        if (done) return; done = true; clearTimeout(timer); resolve(null);
+      });
+    });
+  }
 
   function netOne(url, dataType, headers, post) {
     return new Promise(function (resolve) {
@@ -124,8 +350,11 @@
     return order.reduce(function (chain, candidate) {
       return chain.then(function (result) {
         if (result) return result;
-        return netOne(candidate, 'text', headers, post).then(function (data) {
+        var t0 = Date.now();
+        return withTimeout(netOne(candidate, 'text', headers, post), TIMEOUT + 2000).then(function (data) {
           if (data && isProxy(candidate)) preferProxy = true;
+          dbg('api', (post ? 'POST ' : 'GET ') + (isProxy(candidate) ? 'proxy ' : '') + hostOf(candidate) +
+            (data ? ' ok ' : ' FAIL ') + (Date.now() - t0) + 'ms');
           return data;
         });
       });
@@ -325,11 +554,13 @@
 
   // GET страницы плеера -> POST /bnsi -> { hlsSource, tracks, origin }
   function fetchStream(iframe, token) {
+    dbg('resolve', 'page ' + shortUrl(iframe));
     return req(iframe, 'text', { 'User-Agent': UA, Referer: LINKPP_REFERER }).then(function (html) {
       var parsed = parsePlayer(html);
-      if (!parsed) return null;
+      if (!parsed) { dbg('resolve', 'parse FAIL (' + (html ? String(html).length : 0) + 'b)'); return null; }
 
       var fl = parsed.fileList;
+      dbg('resolve', 'page ok active.id=' + fl.active.id + ' type=' + fl.type);
       var kind = fl.type === 'trailer' ? 'trailers' : 'movies';
       var origin = originOf(iframe);
       if (!origin) return null;
@@ -348,7 +579,11 @@
 
       return reqPost(url, body, headers).then(function (data) {
         var json = asObject(data);
-        if (!json || !json.hlsSource || !json.hlsSource.length) return null;
+        if (!json || !json.hlsSource || !json.hlsSource.length) {
+          dbg('resolve', 'bnsi FAIL (' + (data ? String(data).length : 0) + 'b) ' + shortUrl(url));
+          return null;
+        }
+        dbg('resolve', 'bnsi ok voices=' + json.hlsSource.length + ' subs=' + ((json.tracks || []).length));
 
         return {
           hlsSource: json.hlsSource,
@@ -453,15 +688,18 @@
     while (resolveActive < RESOLVE_MAX && resolveQueue.length) {
       (function (job) {
         resolveActive++;
-        fetchStream(job.iframe, job.token).then(function (stream) {
+        var t0 = Date.now();
+        dbg('queue', 'start (active=' + resolveActive + ' waiting=' + resolveQueue.length + ')');
+        withTimeout(fetchStream(job.iframe, job.token), 30000).then(function (stream) {
           resolveActive--;
-          if (!stream) delete streamCache[job.iframe];
+          if (!stream) { delete streamCache[job.iframe]; dbg('queue', 'null ' + (Date.now() - t0) + 'ms'); }
           else job.rec.time = Date.now();
           job.resolve(stream);
           pumpResolve();
         }, function () {
           resolveActive--;
           delete streamCache[job.iframe];
+          dbg('queue', 'error ' + (Date.now() - t0) + 'ms');
           job.resolve(null);
           pumpResolve();
         });
@@ -477,7 +715,10 @@
 
     var cached = streamCache[iframe];
     if (cached) {
-      if (cached.time === 0 || Date.now() - cached.time < STREAM_TTL) return cached.promise;
+      if (cached.time === 0 || Date.now() - cached.time < STREAM_TTL) {
+        dbg('resolve', 'cache hit ' + shortUrl(iframe));
+        return cached.promise;
+      }
       delete streamCache[iframe];
     }
 
@@ -936,7 +1177,9 @@
 
     function play(element, item) {
       try {
-        if (DIAG) diag('play host=' + hostOf(element.url) + ' q=' + Object.keys(element.quality || {}).length);
+        dbg('play', 'host=' + hostOf(element.url) + ' q=' + Object.keys(element.quality || {}).length +
+          ' subs=' + ((element.subtitles || []).length) + ' urlLen=' + String(element.url || '').length);
+        dbgWatchVideo();
         markWatch(item);
         Lampa.Player.play(element);
         if (element.playlist) Lampa.Player.playlist(element.playlist);
@@ -1334,33 +1577,39 @@
 
       load('Поиск источника…');
 
-      if (DIAG) {
-        var plat = (Lampa.Platform && Lampa.Platform.is)
-          ? ['tizen', 'webos', 'android', 'orsay', 'netcast'].filter(function (p) { return Lampa.Platform.is(p); }).join(',')
-          : '?';
-        diag('loc=' + locInfo() + ' plat=' + plat);
-      }
+      var plat = (Lampa.Platform && Lampa.Platform.is)
+        ? ['tizen', 'webos', 'android', 'orsay', 'netcast'].filter(function (p) { return Lampa.Platform.is(p); }).join(',') || 'browser'
+        : '?';
+      dbg('start', 'loc=' + locInfo() + ' plat=' + plat + ' kp=' + (object.movie && object.movie.kinopoisk_id) +
+        ' title=' + ((object.movie && (object.movie.title || object.movie.name)) || ''));
 
       getKinopoiskId().then(function (id) {
         if (!id) {
+          dbg('start', 'kp id НЕ найден');
           fail('Не удалось определить kinopoisk ID');
           return;
         }
+        dbg('start', 'kp=' + id);
 
         load('Ищу источник…');
 
         return discoverToken(id).then(function (tok) {
           token = tok || DEFAULT_TOKEN;
+          dbg('start', 'token ' + (tok ? 'из linkpp' : 'DEFAULT') + ' ' + String(token).slice(0, 8) + '…');
 
           load('Загружаю данные…');
 
           return loadMeta(token, id).then(function (meta) {
             if (!meta) {
+              dbg('start', 'meta НЕТ');
               fail('Alloha недоступен для этого фильма');
               return;
             }
 
             metaTmdbId = meta.id_tmdb || null;
+            dbg('start', 'meta ok name=' + meta.name + ' tmdb=' + meta.id_tmdb +
+              ' translation_iframe=' + Object.keys(meta.translation_iframe || {}).length +
+              ' seasons=' + Object.keys(meta.seasons || {}).length);
 
             var isSerial = !!meta.seasons && Object.keys(meta.seasons).length > 0;
 
@@ -1502,6 +1751,8 @@
     window.alloha_plugin = true;
 
     injectStyles();
+    dbgHookNet();
+    if (dbgEnabled()) { dbgEnsure(); dbg('diag', 'plugin start ' + locInfo()); }
     Lampa.Component.add('alloha', Alloha);
 
     var manifest = {
