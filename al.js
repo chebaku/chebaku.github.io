@@ -54,16 +54,42 @@
     style: false,
     paint: null,
     videoTimer: 0,
-    lastSample: 0
+    lastSample: 0,
+    mediaOk: 0,
+    mediaFail: 0,
+    lastMediaOk: 0,
+    lastMediaFail: 0
   };
 
   function hostOf(url) {
     try { return new URL(url).host; } catch (e) { return String(url || '').slice(0, 40); }
   }
 
+  function isMediaUrl(url) {
+    var u = String(url || '');
+    if (u.indexOf('/param/') !== -1) return true;
+    if (u.indexOf('vkvideo.cloud') !== -1) return true;
+    return /\.(m3u8|ts|m4s|mp4|mpd|vtt|aac)(\?|$)/i.test(u);
+  }
+
   function shortUrl(url) {
     var s = String(url || '');
+
+    // Медиа через rte: .../param/Origin=.../param/Referer=.../param/User-Agent=.../<target>
+    if (s.indexOf('/param/') !== -1) {
+      var m = s.match(/^[a-z]+:\/\/[^/]+\/([\s\S]*)$/i);
+      var rest = m ? m[1] : s;
+      rest = rest.replace(/^(?:param\/[^/]+\/)+/, '');
+      return 'rte>' + hostOf(rest) + String(rest).replace(/^[a-z]+:\/\/[^/]+/i, '').slice(0, 44);
+    }
+
     return hostOf(s) + s.replace(/^[a-z]+:\/\/[^/]+/i, '').slice(0, 72);
+  }
+
+  // Подпись CDN Alloha живёт ~5-6.5 мин; после этого медиа-запросы → 403.
+  // Сигналим компоненту, чтобы тот перезапустил поток со свежим URL.
+  function notifyMedia403() {
+    try { document.dispatchEvent(new CustomEvent('alloha-media-403')); } catch (e) {}
   }
 
   function locInfo() {
@@ -166,12 +192,18 @@
           try {
             x.addEventListener('loadend', function () {
               var st = x.status || 0;
+              var u = String(x.__alU || '');
+              if (isMediaUrl(u)) {
+                if (st >= 200 && st < 400) { DBG.mediaOk++; DBG.lastMediaOk = Date.now(); }
+                else { DBG.mediaFail++; DBG.lastMediaFail = Date.now(); }
+                if (st === 403) notifyMedia403();
+              }
               var important = st >= 400 || st === 0 ||
-                String(x.__alU || '').indexOf('.m3u8') !== -1 ||
+                u.indexOf('.m3u8') !== -1 ||
                 String(x.__alM || '').toUpperCase() === 'POST';
               if (important) {
                 dbg(st >= 400 || st === 0 ? 'NET!' : 'net',
-                  (x.__alM || 'GET') + ' ' + st + ' ' + (Date.now() - t0) + 'ms ' + shortUrl(x.__alU));
+                  (x.__alM || 'GET') + ' ' + st + ' ' + (Date.now() - t0) + 'ms ' + shortUrl(u));
               }
             });
           } catch (e) {}
@@ -188,6 +220,11 @@
           var t0 = Date.now();
           return origFetch.apply(this, arguments).then(function (res) {
             var st = (res && res.status) || 0;
+            if (isMediaUrl(url)) {
+              if (st >= 200 && st < 400) { DBG.mediaOk++; DBG.lastMediaOk = Date.now(); }
+              else { DBG.mediaFail++; DBG.lastMediaFail = Date.now(); }
+              if (st === 403) notifyMedia403();
+            }
             if (st >= 400) dbg('NET!', 'fetch ' + st + ' ' + (Date.now() - t0) + 'ms ' + shortUrl(url));
             else if (String(url).indexOf('.m3u8') !== -1) dbg('net', 'm3u8 ' + st + ' ' + (Date.now() - t0) + 'ms ' + shortUrl(url));
             return res;
@@ -235,8 +272,10 @@
         DBG.lastSample = now;
         var buf2 = 0, end2 = 0;
         try { if (v.buffered.length) { end2 = v.buffered.end(v.buffered.length - 1); buf2 = end2 - v.currentTime; } } catch (e) {}
+        var agoOk = DBG.lastMediaOk ? Math.round((now - DBG.lastMediaOk) / 1000) + 's' : '-';
         dbg('tick', 't=' + Math.round(v.currentTime) + ' end=' + Math.round(end2) + ' buf=' + Math.round(buf2) +
-          's rs=' + v.readyState + ' ns=' + v.networkState);
+          's rs=' + v.readyState + ' ns=' + v.networkState +
+          ' seg=' + DBG.mediaOk + '/' + DBG.mediaFail + ' lastOk=' + agoOk);
       }
     }, 1500);
   }
@@ -259,6 +298,14 @@
     clear: dbgClear,
     lines: function () { return DBG.lines.slice(); }
   };
+
+  // Активный обработчик 403 от медиа-CDN (ставит текущий компонент Alloha).
+  var media403Handler = null;
+  try {
+    document.addEventListener('alloha-media-403', function () {
+      if (media403Handler) media403Handler();
+    });
+  } catch (e) {}
 
   function isProxy(url) {
     return PROXIES.some(function (base) { return url.indexOf(base) === 0; });
@@ -682,7 +729,12 @@
   var resolveActive = 0;
   var resolveQueue = [];
   var RESOLVE_MAX = 2;
+  // Прогрев карточек (подписи качеств/субтитров) может жить долго — подпись
+  // CDN всё равно проверяется при воспроизведении.
   var STREAM_TTL = 10 * 60 * 1000;
+  // А вот ДЛЯ ВОСПРОИЗВЕДЕНИЯ подписанный URL нельзя брать из старого кэша:
+  // используем его только для дедупа быстрых повторных кликов.
+  var PLAY_TTL = 20 * 1000;
 
   function pumpResolve() {
     while (resolveActive < RESOLVE_MAX && resolveQueue.length) {
@@ -710,15 +762,18 @@
   // iframe -> Promise<stream>. Повторные запросы дедуплицируются, параллелизм
   // ограничен RESOLVE_MAX, а готовый поток живёт STREAM_TTL — после этого
   // перерезолвим, чтобы подписанный m3u8 не успел протухнуть.
-  function resolveStream(iframe, token) {
+  function resolveStream(iframe, token, maxAge) {
     if (!iframe) return Promise.resolve(null);
 
+    var ttl = typeof maxAge === 'number' ? maxAge : STREAM_TTL;
     var cached = streamCache[iframe];
     if (cached) {
-      if (cached.time === 0 || Date.now() - cached.time < STREAM_TTL) {
-        dbg('resolve', 'cache hit ' + shortUrl(iframe));
+      var age = cached.time ? (Date.now() - cached.time) : 0;
+      if (cached.time === 0 || age < ttl) {
+        dbg('resolve', 'cache hit age=' + Math.round(age / 1000) + 's ' + shortUrl(iframe));
         return cached.promise;
       }
+      dbg('resolve', 'cache STALE age=' + Math.round(age / 1000) + 's -> re-resolve');
       delete streamCache[iframe];
     }
 
@@ -857,6 +912,17 @@
     var serialSeason = null;
     var token = null;
     var metaTmdbId = null;
+
+    // Сторож протухшей подписи CDN (URL Alloha живёт ~5-6.5 мин): при 403 на
+    // медиа или при зависании воспроизведения перерезолвим поток и продолжим
+    // с текущей позиции (Lampa сама доигрывает по timeline).
+    var watchdog = null;
+    var currentPlay = null;      // { item, hash, pick, playlist }
+    var lastPos = -1;
+    var lastPosAt = 0;
+    var restarting = false;
+    var restartCooldown = 0;
+    var STALL_MS = 10000;
 
     this.create = function () {
       return this.render();
@@ -1177,6 +1243,7 @@
 
     function play(element, item) {
       try {
+        DBG.mediaOk = 0; DBG.mediaFail = 0; DBG.lastMediaOk = 0; DBG.lastMediaFail = 0;
         dbg('play', 'host=' + hostOf(element.url) + ' q=' + Object.keys(element.quality || {}).length +
           ' subs=' + ((element.subtitles || []).length) + ' urlLen=' + String(element.url || '').length);
         dbgWatchVideo();
@@ -1193,12 +1260,98 @@
       }
     }
 
+    // --- Сторож перезапуска потока ----------------------------------------
+
+    function beginWatch(item, hash, pick, playlist) {
+      currentPlay = { item: item, hash: hash, pick: pick, playlist: playlist || null };
+      lastPos = -1;
+      lastPosAt = Date.now();
+      restarting = false;
+      media403Handler = handleMedia403;
+
+      if (watchdog) clearInterval(watchdog);
+      watchdog = setInterval(watchTick, 2000);
+    }
+
+    function stopWatch() {
+      if (watchdog) { clearInterval(watchdog); watchdog = null; }
+      currentPlay = null;
+      if (media403Handler === handleMedia403) media403Handler = null;
+    }
+
+    function watchTick() {
+      if (restarting || !currentPlay) return;
+
+      var v = null;
+      try { v = document.querySelector('video'); } catch (e) {}
+      if (!v) { stopWatch(); return; }
+
+      // Пауза/перемотка — сбрасываем отсчёт.
+      if (v.paused || v.seeking) { lastPos = v.currentTime; lastPosAt = Date.now(); return; }
+
+      if (v.currentTime > lastPos + 0.8) { lastPos = v.currentTime; lastPosAt = Date.now(); return; }
+
+      if (Date.now() - lastPosAt > STALL_MS) {
+        lastPosAt = Date.now();
+        dbg('watchdog', 'stall t=' + Math.round(v.currentTime) + 's -> restart');
+        restartStream();
+      }
+    }
+
+    // 403 на медиа — свежий резолв и перезапуск с текущей позиции.
+    function handleMedia403() {
+      if (restarting || !currentPlay) return;
+      if (Date.now() - restartCooldown < 15000) return;
+      restartCooldown = Date.now();
+      dbg('watchdog', 'media 403 -> restart');
+      restartStream();
+    }
+
+    function restartStream() {
+      if (restarting || !currentPlay) return;
+      restarting = true;
+
+      var cp = currentPlay;
+      var at = 0, dur = 0;
+      try {
+        var v = document.querySelector('video');
+        at = v ? v.currentTime : 0;
+        dur = v ? (v.duration || 0) : 0;
+      } catch (e) {}
+
+      withLoader(function (stopLoad) {
+        resolveStream(cp.item.iframe, token, 0).then(function (stream) {
+          stopLoad();
+          if (!stream) { restarting = false; Lampa.Noty.show('Не удалось перезапустить поток'); return; }
+
+          var chosen = pickTrack(stream, cp.pick);
+          var el = toElement(stream, chosen, cp.item, cp.hash);
+          if (!el) { restarting = false; Lampa.Noty.show('Не удалось перезапустить поток'); return; }
+
+          if (at && dur) {
+            el.timeline.time = at;
+            el.timeline.percent = Math.min(99, Math.round(at / dur * 100));
+            el.timeline.duration = dur;
+          }
+
+          if (cp.playlist && cp.playlist.length > 1) {
+            el.playlist = buildPlaylist(cp.playlist, cp.item, el);
+          }
+
+          play(el, cp.item);
+          restarting = false;
+          lastPos = -1;
+          lastPosAt = Date.now();
+        });
+      });
+    }
+
     // Фильм: озвучка выбирает физический файл (translation=), POST отдаёт его
     // дорожки. Поток обычно уже прогрет decorateCard; дорожку подбираем молча
     // (pickTrack), без лишнего диалога выбора.
     function playMovieCard(item, hash) {
       withLoader(function (stopLoad) {
-        resolveStream(item.iframe, token).then(function (stream) {
+        resolveStream(item.iframe, token, PLAY_TTL).then(function (stream) {
           stopLoad();
 
           if (!stream) {
@@ -1213,6 +1366,7 @@
             return;
           }
 
+          beginWatch(item, hash, item.title, null);
           play(element, item);
         });
       });
@@ -1392,7 +1546,7 @@
     // (ленивый резолв при переключении).
     function playEpisode(item, hash, playlist) {
       withLoader(function (stopLoad) {
-        resolveStream(item.iframe, token).then(function (stream) {
+        resolveStream(item.iframe, token, PLAY_TTL).then(function (stream) {
           stopLoad();
           if (!stream) {
             Lampa.Noty.show('Нет ссылки на поток');
@@ -1410,6 +1564,7 @@
             element.playlist = buildPlaylist(playlist, item, element);
           }
 
+          beginWatch(item, hash, item.voice, playlist);
           play(element, item);
         });
       });
@@ -1432,7 +1587,7 @@
           if (currentElement.subtitles) cell.subtitles = currentElement.subtitles;
         } else {
           cell.url = function (call) {
-            resolveStream(entry.iframe, token).then(function (stream) {
+            resolveStream(entry.iframe, token, PLAY_TTL).then(function (stream) {
               if (!stream) {
                 cell.url = '';
                 Lampa.Noty.show('Нет ссылки на поток');
@@ -1448,6 +1603,8 @@
                 cell.headers = el.headers;
                 if (el.quality) cell.quality = el.quality;
                 if (el.subtitles) cell.subtitles = el.subtitles;
+                // Переключились на другую серию — сторож теперь ведёт её.
+                beginWatch(entry, entry.hash, entry.voice, entries);
               } else {
                 cell.url = '';
                 Lampa.Noty.show('Нет ссылки на поток');
@@ -1689,6 +1846,7 @@
     this.stop = function () {};
 
     this.destroy = function () {
+      stopWatch();
       if (files && typeof files.destroy === 'function') files.destroy();
       if (scroll && typeof scroll.destroy === 'function') scroll.destroy();
     };
