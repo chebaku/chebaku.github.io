@@ -129,6 +129,10 @@
     try { return JSON.parse(data); } catch (e) { return null; }
   }
 
+  function log() {
+    try { console.log.apply(console, ['FILMIX'].concat([].slice.call(arguments))); } catch (e) {}
+  }
+
   function escapeHtml(text) {
     return String(text == null ? '' : text)
       .replace(/&/g, '&amp;')
@@ -571,14 +575,18 @@
           var f = movieObj[k] || {};
           var q = qualitiesOf(f);
           if (!q.length) return;
-          if (/Заблокировано правообладателем/i.test(f.translation || '')) return;
           movies.push({
             key: k,
             translation: f.translation || ('Озвучка ' + (movies.length + 1)),
-            qualities: q
+            qualities: q,
+            blocked: /Заблокировано правообладателем/i.test(f.translation || '')
           });
         });
-        if (movies.length) return { movies: movies };
+        if (movies.length) {
+          // Заблокированные правообладателем — в конец списка.
+          movies.sort(function (a, b) { return (a.blocked ? 1 : 0) - (b.blocked ? 1 : 0); });
+          return { movies: movies };
+        }
       }
 
       var playlist = pl.playlist || {};
@@ -616,6 +624,9 @@
       withLoader(function (stopLoad) {
         apiGet('post/' + id).then(function (post) {
           stopLoad();
+          var pl = (post && post.player_links) || {};
+          log('post', id, 'movie=', pl.movie ? Object.keys(pl.movie).length : 0,
+            'playlist=', pl.playlist ? Object.keys(pl.playlist).length : 0);
           var model = buildModel(post);
           if (!model) { status('Нет доступных дорожек'); return; }
           if (model.movies) { renderMovies(model.movies); return; }
@@ -663,6 +674,8 @@
 
       var scored = list.map(function (c) { return { c: c, s: scoreCard(c, titles, year) }; });
       scored.sort(function (a, b) { return b.s - a.s; });
+
+      log('search', titles.join(' | '), '->', list.length, 'best=', scored[0] && scored[0].c.title, scored[0] && scored[0].s);
 
       if (scored.length && scored[0].s >= 2 && (!scored[1] || scored[0].s > scored[1].s)) {
         loadPost(scored[0].c.id);
