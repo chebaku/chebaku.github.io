@@ -208,6 +208,7 @@
   // запрашиваемого сегмента. hls.js продолжает качать без ошибок.
   var currentProxyBase = null;
   var hashReplacements = {};
+  var currentPlay = null;
 
   var mediaSession = {
     active: false,
@@ -265,30 +266,6 @@
         Hls.DefaultConfig.fragLoadingMaxRetryTimeout = 64000;
         Hls.DefaultConfig.levelLoadingMaxRetry = 8;
         Hls.DefaultConfig.manifestLoadingMaxRetry = 8;
-      }
-    } catch (e) {}
-
-    try {
-      if (window.Hls && window.Hls.prototype && !window.Hls.prototype.__alHooked) {
-        window.Hls.prototype.__alHooked = true;
-        var origOn = window.Hls.prototype.on;
-        window.Hls.prototype.on = function (event, handler) {
-          var errEv = (window.Hls.Events && window.Hls.Events.ERROR) || 'hlsError';
-          if (event === errEv) {
-            var origHandler = handler;
-            handler = function (ev, data) {
-              var details = data ? (data.details || data.type || '') : '';
-              var fatal = !!(data && data.fatal);
-              dbg('hls', 'hls.js error ' + details + (fatal ? ' fatal' : ''));
-              if (fatal) {
-                currentProxyBase = null;
-                triggerPlayerRecovery('hls-fatal: ' + details);
-              }
-              return origHandler.apply(this, arguments);
-            };
-          }
-          return origOn.call(this, event, handler);
-        };
       }
     } catch (e) {}
 
@@ -581,7 +558,10 @@
           }
           if (childPath) {
             var childUrl = (function () {
-              try { return new URL(childPath, url).href; } catch (e) { return null; }
+              try {
+                if (/^https?:\/\//i.test(childPath)) return childPath;
+                return url.replace(/[^/]+(?:\?.*)?$/, '') + childPath;
+              } catch (e) { return null; }
             })();
             if (childUrl) {
               var netChild = new Lampa.Reguest();
@@ -1324,7 +1304,7 @@
     // медиа или при зависании воспроизведения перерезолвим поток и продолжим
     // с текущей позиции (Lampa сама доигрывает по timeline).
     var watchdog = null;
-    var currentPlay = null;      // { item, hash, pick, playlist }
+    currentPlay = null;          // { item, hash, pick, playlist }
     var lastPos = -1;
     var lastPosAt = 0;
     var restarting = false;
@@ -1867,14 +1847,15 @@
     function playMovieCard(item, hash) {
       withLoader(function (stopLoad) {
         resolveStream(item.iframe, token, PLAY_TTL).then(function (stream) {
-          stopLoad();
           if (!stream) {
+            stopLoad();
             Lampa.Noty.show('Поток недоступен (' + item.title + ')');
             return;
           }
 
           var chosen = pickTrack(stream, item.title);
           buildElement(stream, chosen, item, hash).then(function (element) {
+            stopLoad();
             if (!element) {
               Lampa.Noty.show('Нет ссылки на поток');
               return;
@@ -1883,7 +1864,13 @@
             initMediaSession(item.iframe, item.title, token, chosen);
             beginWatch(item, hash, item.title, null);
             play(element, item);
+          }, function () {
+            stopLoad();
+            Lampa.Noty.show('Ошибка построения потока');
           });
+        }, function () {
+          stopLoad();
+          Lampa.Noty.show('Ошибка резолва потока');
         });
       });
     }
@@ -2063,14 +2050,15 @@
     function playEpisode(item, hash, playlist) {
       withLoader(function (stopLoad) {
         resolveStream(item.iframe, token, PLAY_TTL).then(function (stream) {
-          stopLoad();
           if (!stream) {
+            stopLoad();
             Lampa.Noty.show('Поток серии недоступен (' + item.voice + ')');
             return;
           }
 
           var chosen = pickTrack(stream, item.voice);
           buildElement(stream, chosen, item, hash).then(function (element) {
+            stopLoad();
             if (!element) {
               Lampa.Noty.show('Нет ссылки на поток');
               return;
@@ -2083,7 +2071,13 @@
             initMediaSession(item.iframe, item.voice, token, chosen);
             beginWatch(item, hash, item.voice, playlist);
             play(element, item);
+          }, function () {
+            stopLoad();
+            Lampa.Noty.show('Ошибка построения потока');
           });
+        }, function () {
+          stopLoad();
+          Lampa.Noty.show('Ошибка резолва потока');
         });
       });
     }
