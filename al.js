@@ -24,10 +24,9 @@
     'https://proxy7.rte.net.ru/'
   ];
 
-  // ext.rte.net.ru:8443 — отдельный прокси с egress в другом ASN (не Timeweb),
-  // поэтому обслуживает UHD-edge, который режет Timeweb. Держим его только для
-  // МЕДИА (первым), чтобы разгрузить от API-запросов; rte-узлы — фолбэк.
-  var MEDIA_PROXIES = ['https://ext.rte.net.ru:8443/'].concat(API_PROXIES);
+  // Медиа-прокси: стабильные узлы rte первыми, ext.rte.net.ru:8443 (альтернативный egress)
+  // проверяется параллельно с ними через chooseProxy.
+  var MEDIA_PROXIES = API_PROXIES.concat(['https://ext.rte.net.ru:8443/']);
   var TIMEOUT = 15000;
 
   // Токен linkpp меняется, но живой. Если p.linkpp.ink не отдал Alloha —
@@ -192,13 +191,66 @@
     } catch (e) { return ''; }
   }
 
+  // --- Активная сессия потока и подмена токена на лету -------------------
+  //
+  // Подпись CDN Alloha (*.vkvideo.cloud) живёт ~5-6.5 мин. Чтобы фильм не
+  // прерывался и плеер не падал в 403 с последующим зависанием/рестартом,
+  // мы отслеживаем активную сессию и периодически (раз в 3.5 мин) в фоне
+  // перерезолвим поток. Новые хеши сохраняются в hashReplacements, и в XHR/fetch
+  // хуке устаревший хеш прозрачно заменяется на актуальный прямо в URL
+  // запрашиваемого сегмента. hls.js продолжает качать без ошибок.
+  var currentProxyBase = null;
+  var hashReplacements = {};
+
+  var mediaSession = {
+    active: false,
+    iframe: null,
+    token: null,
+    voice: null,
+    qualityHashes: {},
+    hashTime: 0,
+    refreshing: false
+  };
+
+  var refreshActiveSessionFn = null;
+
+  function extractHash(url) {
+    var m = String(url || '').match(/\.vkvideo\.cloud\/1\/([^/]+)\//);
+    return m ? m[1] : null;
+  }
+
+  function rewriteMediaUrl(u) {
+    if (!u || !mediaSession.active) return u;
+    var str = String(u);
+    if (str.indexOf('.vkvideo.cloud/1/') === -1) return u;
+
+    return str.replace(/(\.vkvideo\.cloud\/1\/)([^/]+)(\/)/, function (match, prefix, hash, suffix) {
+      var rep = hashReplacements[hash];
+      if (rep && rep !== hash) {
+        return prefix + rep + suffix;
+      }
+      return match;
+    });
+  }
+
+  function triggerSessionRefresh() {
+    if (typeof refreshActiveSessionFn === 'function') {
+      refreshActiveSessionFn();
+    }
+  }
+
   function dbgHookNet() {
     try {
       if (window.XMLHttpRequest && !XMLHttpRequest.__alHooked) {
         XMLHttpRequest.__alHooked = true;
         var open = XMLHttpRequest.prototype.open;
         var send = XMLHttpRequest.prototype.send;
-        XMLHttpRequest.prototype.open = function (m, u) { this.__alM = m; this.__alU = u; return open.apply(this, arguments); };
+        XMLHttpRequest.prototype.open = function (m, u) {
+          var target = rewriteMediaUrl(u);
+          this.__alM = m;
+          this.__alU = target;
+          return open.call(this, m, target);
+        };
         XMLHttpRequest.prototype.send = function () {
           var x = this, t0 = Date.now();
           try {
@@ -210,7 +262,10 @@
                 else { DBG.mediaFail++; DBG.lastMediaFail = Date.now(); }
                 // На Tizen поток тянет AVPlay нативно, поэтому любой XHR-403 тут —
                 // это парсер hls.js или проба (оба нефатальны): не дёргаем сторож.
-                if (st === 403 && !probing && !Lampa.Platform.is('tizen')) notifyMedia403();
+                if (st === 403 && !probing && !Lampa.Platform.is('tizen')) {
+                  triggerSessionRefresh();
+                  notifyMedia403();
+                }
               }
               var important = st >= 400 || st === 0 ||
                 u.indexOf('.m3u8') !== -1 ||
@@ -230,21 +285,26 @@
     try {
       if (window.fetch && !window.fetch.__alHooked) {
         var origFetch = window.fetch;
-        var wrapped = function (input) {
-          var url = (input && input.url) ? input.url : String(input);
+        var wrapped = function (input, init) {
+          var rawUrl = (input && input.url) ? input.url : String(input);
+          var target = rewriteMediaUrl(rawUrl);
+          var actualInput = (input && input.url && window.Request) ? new Request(target, input) : target;
           var t0 = Date.now();
-          return origFetch.apply(this, arguments).then(function (res) {
+          return origFetch.call(this, actualInput, init).then(function (res) {
             var st = (res && res.status) || 0;
-            if (isMediaUrl(url)) {
+            if (isMediaUrl(target)) {
               if (st >= 200 && st < 400) { DBG.mediaOk++; DBG.lastMediaOk = Date.now(); }
               else { DBG.mediaFail++; DBG.lastMediaFail = Date.now(); }
-              if (st === 403 && !probing && !Lampa.Platform.is('tizen')) notifyMedia403();
+              if (st === 403 && !probing && !Lampa.Platform.is('tizen')) {
+                triggerSessionRefresh();
+                notifyMedia403();
+              }
             }
-            if (st >= 400) dbg('NET!', 'fetch ' + st + ' ' + (Date.now() - t0) + 'ms ' + shortUrl(url));
-            else if (String(url).indexOf('.m3u8') !== -1) dbg('net', 'm3u8 ' + st + ' ' + (Date.now() - t0) + 'ms ' + shortUrl(url));
+            if (st >= 400) dbg('NET!', 'fetch ' + st + ' ' + (Date.now() - t0) + 'ms ' + shortUrl(target));
+            else if (String(target).indexOf('.m3u8') !== -1) dbg('net', 'm3u8 ' + st + ' ' + (Date.now() - t0) + 'ms ' + shortUrl(target));
             return res;
           }, function (err) {
-            dbg('NET!', 'fetch FAIL ' + (Date.now() - t0) + 'ms ' + shortUrl(url) + ' ' + (err && err.message || ''));
+            dbg('NET!', 'fetch FAIL ' + (Date.now() - t0) + 'ms ' + shortUrl(target) + ' ' + (err && err.message || ''));
             throw err;
           });
         };
@@ -427,7 +487,7 @@
   function probeOnce(base, url, origin) {
     return new Promise(function (resolve) {
       var network = new Lampa.Reguest();
-      network.timeout(7000);
+      network.timeout(3500);
       probing++;
       var done = function (v) { probing--; if (probing < 0) probing = 0; resolve(v); };
       network.silent(mediaProxyUrl(base, url, origin), function (data) {
@@ -435,49 +495,55 @@
       }, function () {
         done(false);
       }, false, {
-        dataType: 'text',
-        headers: { 'User-Agent': UA, Origin: origin, Referer: origin + '/' }
+        dataType: 'text'
       });
     });
   }
 
-  // Общий egress у ext/rte периодически режет CDN: одиночный 403 не приговор,
-  // следующая попытка часто проходит. Пробуем узел до PROBE_TRIES раз; успех —
-  // при первой удачной попытке.
-  var PROBE_TRIES = 3;
-  var PROBE_DELAY = 400;
+  function parallelChooseProxy(url, origin) {
+    return new Promise(function (resolve) {
+      var done = false;
+      var failed = 0;
+      var total = MEDIA_PROXIES.length;
 
-  function probeProxy(base, url, origin, tries) {
-    var left = tries == null ? PROBE_TRIES : tries;
-    return probeOnce(base, url, origin).then(function (ok) {
-      if (ok) return true;
-      if (left <= 1) return false;
-      return new Promise(function (r) { setTimeout(r, PROBE_DELAY); })
-        .then(function () { return probeProxy(base, url, origin, left - 1); });
+      MEDIA_PROXIES.forEach(function (base) {
+        probeOnce(base, url, origin).then(function (ok) {
+          if (done) return;
+          if (ok) {
+            done = true;
+            currentProxyBase = base;
+            dbg('proxy', 'выбран ' + hostOf(base));
+            resolve(base);
+          } else {
+            dbg('proxy', hostOf(base) + ' FAIL');
+            failed++;
+            if (failed >= total && !done) {
+              done = true;
+              var fallback = currentProxyBase || MEDIA_PROXIES[0];
+              dbg('proxy', 'все пробы 403 → играю через ' + hostOf(fallback) + ' без пробы');
+              resolve(fallback);
+            }
+          }
+        });
+      });
     });
   }
 
   function chooseProxy(url, origin) {
     if (!url || directPlatform()) return Promise.resolve(null);
 
-    return new Promise(function (resolve) {
-      var i = 0;
-      (function next() {
-        if (i >= MEDIA_PROXIES.length) {
-          // Все пробы упали: чаще всего это кратковременный бан общего egress.
-          // Не отдаём «мёртвый» false (это блокировало воспроизведение) — играем
-          // через первый узел (ext) без пробы, а сторож перезапустит по 403.
-          dbg('proxy', 'все пробы 403 → играю через ' + hostOf(MEDIA_PROXIES[0]) + ' без пробы');
-          resolve(MEDIA_PROXIES[0]);
-          return;
+    // Быстрый путь: если уже был рабочий прокси, сначала проверяем его
+    if (currentProxyBase && MEDIA_PROXIES.indexOf(currentProxyBase) !== -1) {
+      return probeOnce(currentProxyBase, url, origin).then(function (ok) {
+        if (ok) {
+          dbg('proxy', 'сохранён рабочий ' + hostOf(currentProxyBase));
+          return currentProxyBase;
         }
-        var base = MEDIA_PROXIES[i++];
-        probeProxy(base, url, origin).then(function (ok) {
-          if (ok) { dbg('proxy', 'выбран ' + hostOf(base)); resolve(base); }
-          else { dbg('proxy', hostOf(base) + ' FAIL'); next(); }
-        });
-      })();
-    });
+        return parallelChooseProxy(url, origin);
+      });
+    }
+
+    return parallelChooseProxy(url, origin);
   }
 
   // --- Сетевой слой (как в tu.js: прямой запрос, при неудаче — CORS-прокси) --
@@ -943,6 +1009,80 @@
 
     return russian[0] || list[0];
   }
+
+  function initMediaSession(iframe, voice, tok, chosenTrack) {
+    mediaSession.active = true;
+    mediaSession.iframe = iframe;
+    mediaSession.token = tok || DEFAULT_TOKEN;
+    mediaSession.voice = voice;
+    mediaSession.hashTime = Date.now();
+    mediaSession.refreshing = false;
+    mediaSession.qualityHashes = {};
+    Object.keys(hashReplacements).forEach(function (k) { delete hashReplacements[k]; });
+
+    if (chosenTrack) {
+      var dict = qualityDict(chosenTrack);
+      Object.keys(dict).forEach(function (q) {
+        var h = extractHash(dict[q]);
+        if (h) mediaSession.qualityHashes[q] = h;
+      });
+    }
+
+    var keys = Object.keys(mediaSession.qualityHashes);
+    var sample = keys.length ? mediaSession.qualityHashes[keys[0]].slice(0, 16) : 'none';
+    dbg('session', 'init voice=' + voice + ' qCount=' + keys.length + ' hash=' + sample + '…');
+  }
+
+  function refreshActiveSession() {
+    if (!mediaSession.active || !mediaSession.iframe || mediaSession.refreshing) {
+      return Promise.resolve(false);
+    }
+    mediaSession.refreshing = true;
+    var t0 = Date.now();
+    dbg('session', 'refreshing token/hash for ' + shortUrl(mediaSession.iframe));
+
+    return resolveStream(mediaSession.iframe, mediaSession.token || DEFAULT_TOKEN, 0).then(function (stream) {
+      mediaSession.refreshing = false;
+      if (!stream) {
+        dbg('session', 'refresh FAIL (' + (Date.now() - t0) + 'ms)');
+        return false;
+      }
+
+      var chosen = pickTrack(stream, mediaSession.voice);
+      if (!chosen) {
+        dbg('session', 'refresh: track not found');
+        return false;
+      }
+
+      var freshDict = qualityDict(chosen);
+      var updatedCount = 0;
+
+      Object.keys(freshDict).forEach(function (q) {
+        var oldH = mediaSession.qualityHashes[q];
+        var newH = extractHash(freshDict[q]);
+        if (newH) {
+          if (oldH && oldH !== newH) {
+            hashReplacements[oldH] = newH;
+            Object.keys(hashReplacements).forEach(function (k) {
+              if (hashReplacements[k] === oldH) hashReplacements[k] = newH;
+            });
+            updatedCount++;
+          }
+          mediaSession.qualityHashes[q] = newH;
+        }
+      });
+
+      mediaSession.hashTime = Date.now();
+      dbg('session', 'refresh OK (' + (Date.now() - t0) + 'ms), mapped ' + updatedCount + ' hashes');
+      return true;
+    }, function () {
+      mediaSession.refreshing = false;
+      dbg('session', 'refresh error (' + (Date.now() - t0) + 'ms)');
+      return false;
+    });
+  }
+
+  refreshActiveSessionFn = refreshActiveSession;
 
   function maxQuality(stream) {
     var max = 0;
@@ -1434,6 +1574,9 @@
     function stopWatch() {
       if (watchdog) { clearInterval(watchdog); watchdog = null; }
       currentPlay = null;
+      mediaSession.active = false;
+      mediaSession.refreshing = false;
+      Object.keys(hashReplacements).forEach(function (k) { delete hashReplacements[k]; });
       if (media403Handler === handleMedia403) media403Handler = null;
     }
 
@@ -1442,6 +1585,16 @@
 
       var v = findMediaEl();
       if (!v) { stopWatch(); return; }
+
+      // Упреждающее фоновое обновление токена/подписи: раз в 210 с (3.5 мин),
+      // задолго до истечения 5-минутного TTL CDN.
+      if (mediaSession.active && mediaSession.iframe && mediaSession.hashTime) {
+        var hashAge = Date.now() - mediaSession.hashTime;
+        if (hashAge > 210000 && !mediaSession.refreshing) {
+          dbg('session', 'hash age ' + Math.round(hashAge / 1000) + 's >= 210s -> proactive refresh');
+          refreshActiveSession();
+        }
+      }
 
       // Пауза/перемотка — сбрасываем отсчёт.
       if (v.paused || v.seeking) { lastPos = v.currentTime; lastPosAt = Date.now(); return; }
@@ -1455,13 +1608,21 @@
       }
     }
 
-    // 403 на медиа — свежий резолв и перезапуск с текущей позиции.
+    // 403 на медиа — сначала попытка обновления хеша на лету, при неудаче — перезапуск.
     function handleMedia403() {
       if (restarting || !currentPlay) return;
-      if (Date.now() - restartCooldown < 15000) return;
+      if (Date.now() - restartCooldown < 5000) return;
       restartCooldown = Date.now();
-      dbg('watchdog', 'media 403 -> restart');
-      restartStream('403');
+      dbg('watchdog', 'media 403 -> refresh or restart');
+
+      if (mediaSession.active && !mediaSession.refreshing) {
+        refreshActiveSession().then(function (ok) {
+          if (!ok) restartStream('403');
+          else dbg('watchdog', 'media 403: hash refreshed in-flight');
+        });
+      } else {
+        restartStream('403');
+      }
     }
 
     function restartStream(reason) {
@@ -1476,6 +1637,8 @@
         dur = v ? (v.duration || 0) : 0;
       } catch (e) {}
 
+      dbg('watchdog', 'restartStream reason=' + reason + ' at=' + Math.round(at) + 's dur=' + Math.round(dur) + 's');
+
       // Прямой режим Tizen не поехал по НАСТОЯЩЕМУ стопу (поток так и не
       // начался, currentTime ~0) — значит HTTP_HEADER не сработал: уходим на
       // прокси. Откат только по 'stall', не по 403 (403 от парсера/проб — норма).
@@ -1487,13 +1650,18 @@
       withLoader(function (stopLoad) {
         resolveStream(cp.item.iframe, token, 0).then(function (stream) {
           stopLoad();
-          if (!stream) { restarting = false; Lampa.Noty.show('Не удалось перезапустить поток'); return; }
+          if (!stream) {
+            restarting = false;
+            dbg('watchdog', 'перезапуск: stream null');
+            Lampa.Noty.show('Не удалось перезапустить поток');
+            return;
+          }
 
           var chosen = pickTrack(stream, cp.pick);
           buildElement(stream, chosen, cp.item, cp.hash).then(function (el) {
             if (!el) {
               restarting = false;
-              dbg('watchdog', 'перезапуск не удался (403)');
+              dbg('watchdog', 'перезапуск: el null');
               Lampa.Noty.show('Не удалось перезапустить поток');
               return;
             }
@@ -1502,12 +1670,16 @@
               el.timeline.time = at;
               el.timeline.percent = Math.min(99, Math.round(at / dur * 100));
               el.timeline.duration = dur;
+              if (typeof el.timeline.handler === 'function') {
+                try { el.timeline.handler(el.timeline.percent, el.timeline.time, el.timeline.duration); } catch (e) {}
+              }
             }
 
             if (cp.playlist && cp.playlist.length > 1) {
               el.playlist = buildPlaylist(cp.playlist, cp.item, el);
             }
 
+            initMediaSession(cp.item.iframe, cp.pick, token, chosen);
             play(el, cp.item);
             restarting = false;
             lastPos = -1;
@@ -1534,6 +1706,7 @@
               return;
             }
 
+            initMediaSession(item.iframe, item.title, token, chosen);
             beginWatch(item, hash, item.title, null);
             play(element, item);
           });
@@ -1733,6 +1906,7 @@
               element.playlist = buildPlaylist(playlist, item, element);
             }
 
+            initMediaSession(item.iframe, item.voice, token, chosen);
             beginWatch(item, hash, item.voice, playlist);
             play(element, item);
           });
@@ -1773,6 +1947,7 @@
                   cell.headers = el.headers;
                   if (el.quality) cell.quality = el.quality;
                   if (el.subtitles) cell.subtitles = el.subtitles;
+                  initMediaSession(entry.iframe, entry.voice, token, chosen);
                   // Переключились на другую серию — сторож теперь ведёт её.
                   beginWatch(entry, entry.hash, entry.voice, entries);
                 } else {
@@ -2142,7 +2317,14 @@
       serialModel: serialModel,
       timeToSeconds: timeToSeconds,
       allohaDuration: allohaDuration,
-      dateText: dateText
+      dateText: dateText,
+      extractHash: extractHash,
+      rewriteMediaUrl: rewriteMediaUrl,
+      mediaSession: mediaSession,
+      hashReplacements: hashReplacements,
+      initMediaSession: initMediaSession,
+      refreshActiveSession: refreshActiveSession,
+      chooseProxy: chooseProxy
     };
   }
 
