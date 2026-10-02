@@ -80,10 +80,11 @@
 
     // Медиа через rte: .../param/Origin=.../param/Referer=.../param/User-Agent=.../<target>
     if (s.indexOf('/param/') !== -1) {
+      var pHost = hostOf(s).replace(/\.rte\.net\.ru.*$/, '').replace(/https?:\/\//, '');
       var m = s.match(/^[a-z]+:\/\/[^/]+\/([\s\S]*)$/i);
       var rest = m ? m[1] : s;
       rest = rest.replace(/^(?:param\/[^/]+\/)+/, '');
-      return 'rte>' + hostOf(rest) + String(rest).replace(/^[a-z]+:\/\/[^/]+/i, '').slice(0, 44);
+      return (pHost || 'rte') + '>' + hostOf(rest) + String(rest).replace(/^[a-z]+:\/\/[^/]+/i, '').slice(0, 44);
     }
 
     return hostOf(s) + s.replace(/^[a-z]+:\/\/[^/]+/i, '').slice(0, 72);
@@ -237,6 +238,43 @@
     if (typeof refreshActiveSessionFn === 'function') {
       refreshActiveSessionFn();
     }
+  }
+
+  var triggerRecoveryFn = null;
+
+  function triggerPlayerRecovery(reason) {
+    if (typeof triggerRecoveryFn === 'function') {
+      triggerRecoveryFn(reason);
+    }
+  }
+
+  function hookPlayerAndHls() {
+    try {
+      if (window.Hls && Hls.DefaultConfig && !Hls.__alConfigured) {
+        Hls.__alConfigured = true;
+        // Увеличиваем попытки и задержки загрузки фрагментов, чтобы hls.js успевал
+        // дождаться in-flight обновления токена/хеша перед тем как сдаться с fatal: true.
+        Hls.DefaultConfig.fragLoadingMaxRetry = 12;
+        Hls.DefaultConfig.fragLoadingRetryDelay = 1500;
+        Hls.DefaultConfig.fragLoadingMaxRetryTimeout = 64000;
+        Hls.DefaultConfig.levelLoadingMaxRetry = 8;
+        Hls.DefaultConfig.manifestLoadingMaxRetry = 8;
+      }
+    } catch (e) {}
+
+    try {
+      if (window.Lampa && Lampa.Player && Lampa.Player.listener && !Lampa.Player.__alHooked) {
+        Lampa.Player.__alHooked = true;
+        Lampa.Player.listener.follow('error', function (e) {
+          var details = (e && (e.error || e.details || e.type)) || 'unknown';
+          var fatal = e && (e.fatal === true || e.fatal === 'true');
+          dbg('player', 'Lampa.Player error: ' + details + (fatal ? ' fatal' : ''));
+          if (fatal) {
+            triggerPlayerRecovery('player-fatal: ' + details);
+          }
+        });
+      }
+    } catch (e) {}
   }
 
   function dbgHookNet() {
@@ -598,7 +636,13 @@
     // На Android у Lampa нативный сетевой слой — CORS/запрещённых заголовков
     // нет, поэтому прокси не нужны. В вебе — пробуем прокси.
     if (!Lampa.Platform.is('android')) {
-      var proxied = API_PROXIES.map(function (base) { return base + url; });
+      var list = API_PROXIES.slice();
+      // Если для медиа уже выбран рабочий прокси (например proxy4), ставим его первым
+      // и для API-запросов (/bnsi и страницы), чтобы egress совпадал.
+      if (currentProxyBase && list.indexOf(currentProxyBase) !== -1) {
+        list = [currentProxyBase].concat(list.filter(function (p) { return p !== currentProxyBase; }));
+      }
+      var proxied = list.map(function (base) { return base + url; });
       order = preferProxy ? proxied.concat([url]) : [url].concat(proxied);
     }
 
@@ -1554,6 +1598,7 @@
 
     function play(element, item) {
       try {
+        hookPlayerAndHls();
         DBG.mediaOk = 0; DBG.mediaFail = 0; DBG.lastMediaOk = 0; DBG.lastMediaFail = 0;
         var plat = (Lampa.Platform && Lampa.Platform.get) ? Lampa.Platform.get() : '?';
         dbg('play', 'host=' + hostOf(element.url) + ' q=' + Object.keys(element.quality || {}).length +
@@ -1587,6 +1632,9 @@
       lastPosAt = Date.now();
       restarting = false;
       media403Handler = handleMedia403;
+      triggerRecoveryFn = function (reason) {
+        restartStream(reason);
+      };
 
       if (watchdog) clearInterval(watchdog);
       watchdog = setInterval(watchTick, 2000);
@@ -1595,6 +1643,7 @@
     function stopWatch() {
       if (watchdog) { clearInterval(watchdog); watchdog = null; }
       currentPlay = null;
+      triggerRecoveryFn = null;
       mediaSession.active = false;
       mediaSession.refreshing = false;
       Object.keys(hashReplacements).forEach(function (k) { delete hashReplacements[k]; });
@@ -1617,7 +1666,20 @@
         }
       }
 
-      // Пауза/перемотка — сбрасываем отсчёт.
+      // Проверяем фатальные состояния медиа (ошибка декодера/сети, сброс источника emptied,
+      // или аварийная пауза hls.js после сбоя сегмента).
+      var isDead = (v.error) || (v.networkState === 3) ||
+        (lastPos > 5 && v.currentTime === 0 && v.readyState === 0) ||
+        (v.paused && DBG.lastMediaFail && (Date.now() - DBG.lastMediaFail < 8000) && (Date.now() - DBG.lastMediaOk > 4000));
+
+      if (isDead) {
+        dbg('watchdog', 'dead video state rs=' + v.readyState + ' ns=' + v.networkState +
+          ' p=' + v.paused + (v.error ? ' err=' + v.error.code : '') + ' -> restart');
+        restartStream('dead-state');
+        return;
+      }
+
+      // Пауза/перемотка (настоящая пользовательская) — сбрасываем отсчёт.
       if (v.paused || v.seeking) { lastPos = v.currentTime; lastPosAt = Date.now(); return; }
 
       if (v.currentTime > lastPos + 0.8) { lastPos = v.currentTime; lastPosAt = Date.now(); return; }
@@ -1641,6 +1703,15 @@
           refreshActiveSession().then(function (ok) {
             if (ok) {
               dbg('watchdog', 'media 403: hash refreshed in-flight');
+              // Если плеер успел встать на паузу или выбить ошибку до завершения обновления,
+              // перезапускаем поток со свежим URL, не оставляя пользователя на экране ошибки.
+              setTimeout(function () {
+                var v = findMediaEl();
+                if (v && (v.paused || v.readyState === 0 || v.networkState === 3 || v.error)) {
+                  dbg('watchdog', 'media 403: player stopped after refresh -> restart');
+                  restartStream('403-stopped');
+                }
+              }, 1200);
             } else {
               dbg('watchdog', 'media 403: refresh failed -> restart');
               restartStream('403');
@@ -1658,6 +1729,11 @@
     function restartStream(reason) {
       if (restarting || !currentPlay) return;
       restarting = true;
+
+      try {
+        if (window.Lampa && Lampa.Modal && typeof Lampa.Modal.close === 'function') Lampa.Modal.close();
+        $('.player-error').remove();
+      } catch (e) {}
 
       var cp = currentPlay;
       var at = 0, dur = 0;
