@@ -260,10 +260,13 @@
               if (isMediaUrl(u)) {
                 if (st >= 200 && st < 400) { DBG.mediaOk++; DBG.lastMediaOk = Date.now(); }
                 else { DBG.mediaFail++; DBG.lastMediaFail = Date.now(); }
-                // На Tizen поток тянет AVPlay нативно, поэтому любой XHR-403 тут —
-                // это парсер hls.js или проба (оба нефатальны): не дёргаем сторож.
-                if (st === 403 && !probing && !Lampa.Platform.is('tizen')) {
-                  triggerSessionRefresh();
+                // На Tizen нативный AVPlay тянет поток сам; на старте hls.js даёт проверочный
+                // XHR без Origin (st=403, ожидаемо) — фильтруем первые 5 сек, чтобы не сбивать старт.
+                var isTizenInit = Lampa.Platform.is('tizen') && (!currentPlay || (function () {
+                  var v = findMediaEl();
+                  return !v || v.currentTime < 5;
+                })());
+                if (st === 403 && !probing && !isTizenInit) {
                   notifyMedia403();
                 }
               }
@@ -295,8 +298,11 @@
             if (isMediaUrl(target)) {
               if (st >= 200 && st < 400) { DBG.mediaOk++; DBG.lastMediaOk = Date.now(); }
               else { DBG.mediaFail++; DBG.lastMediaFail = Date.now(); }
-              if (st === 403 && !probing && !Lampa.Platform.is('tizen')) {
-                triggerSessionRefresh();
+              var isTizenInit = Lampa.Platform.is('tizen') && (!currentPlay || (function () {
+                var v = findMediaEl();
+                return !v || v.currentTime < 5;
+              })());
+              if (st === 403 && !probing && !isTizenInit) {
                 notifyMedia403();
               }
             }
@@ -938,9 +944,9 @@
   // Прогрев карточек (подписи качеств/субтитров) может жить долго — подпись
   // CDN всё равно проверяется при воспроизведении.
   var STREAM_TTL = 10 * 60 * 1000;
-  // А вот ДЛЯ ВОСПРОИЗВЕДЕНИЯ подписанный URL нельзя брать из старого кэша:
-  // используем его только для дедупа быстрых повторных кликов.
-  var PLAY_TTL = 20 * 1000;
+  // А вот ДЛЯ ВОСПРОИЗВЕДЕНИЯ подписанный URL всегда должен быть свежим (0 мс),
+  // чтобы фильм стартовал с полным TTL ~5-6 минут.
+  var PLAY_TTL = 0;
 
   function pumpResolve() {
     while (resolveActive < RESOLVE_MAX && resolveQueue.length) {
@@ -1011,20 +1017,35 @@
   }
 
   function initMediaSession(iframe, voice, tok, chosenTrack) {
+    var isSameSession = mediaSession.active && mediaSession.iframe === iframe;
     mediaSession.active = true;
     mediaSession.iframe = iframe;
     mediaSession.token = tok || DEFAULT_TOKEN;
     mediaSession.voice = voice;
     mediaSession.hashTime = Date.now();
     mediaSession.refreshing = false;
+
+    var oldQualityHashes = mediaSession.qualityHashes || {};
     mediaSession.qualityHashes = {};
-    Object.keys(hashReplacements).forEach(function (k) { delete hashReplacements[k]; });
+
+    if (!isSameSession) {
+      Object.keys(hashReplacements).forEach(function (k) { delete hashReplacements[k]; });
+    }
 
     if (chosenTrack) {
       var dict = qualityDict(chosenTrack);
       Object.keys(dict).forEach(function (q) {
         var h = extractHash(dict[q]);
-        if (h) mediaSession.qualityHashes[q] = h;
+        if (h) {
+          mediaSession.qualityHashes[q] = h;
+          var prevH = oldQualityHashes[q];
+          if (prevH && prevH !== h) {
+            hashReplacements[prevH] = h;
+            Object.keys(hashReplacements).forEach(function (k) {
+              if (hashReplacements[k] === prevH) hashReplacements[k] = h;
+            });
+          }
+        }
       });
     }
 
@@ -1586,12 +1607,12 @@
       var v = findMediaEl();
       if (!v) { stopWatch(); return; }
 
-      // Упреждающее фоновое обновление токена/подписи: раз в 210 с (3.5 мин),
+      // Упреждающее фоновое обновление токена/подписи: раз в 120 с (2 мин),
       // задолго до истечения 5-минутного TTL CDN.
       if (mediaSession.active && mediaSession.iframe && mediaSession.hashTime) {
         var hashAge = Date.now() - mediaSession.hashTime;
-        if (hashAge > 210000 && !mediaSession.refreshing) {
-          dbg('session', 'hash age ' + Math.round(hashAge / 1000) + 's >= 210s -> proactive refresh');
+        if (hashAge > 120000 && !mediaSession.refreshing) {
+          dbg('session', 'hash age ' + Math.round(hashAge / 1000) + 's >= 120s -> proactive refresh');
           refreshActiveSession();
         }
       }
@@ -1611,16 +1632,25 @@
     // 403 на медиа — сначала попытка обновления хеша на лету, при неудаче — перезапуск.
     function handleMedia403() {
       if (restarting || !currentPlay) return;
-      if (Date.now() - restartCooldown < 5000) return;
+      if (Date.now() - restartCooldown < 4000) return;
       restartCooldown = Date.now();
-      dbg('watchdog', 'media 403 -> refresh or restart');
 
-      if (mediaSession.active && !mediaSession.refreshing) {
-        refreshActiveSession().then(function (ok) {
-          if (!ok) restartStream('403');
-          else dbg('watchdog', 'media 403: hash refreshed in-flight');
-        });
+      if (mediaSession.active) {
+        if (!mediaSession.refreshing) {
+          dbg('watchdog', 'media 403 -> refresh hash in-flight');
+          refreshActiveSession().then(function (ok) {
+            if (ok) {
+              dbg('watchdog', 'media 403: hash refreshed in-flight');
+            } else {
+              dbg('watchdog', 'media 403: refresh failed -> restart');
+              restartStream('403');
+            }
+          });
+        } else {
+          dbg('watchdog', 'media 403: refresh already in progress, waiting for retry');
+        }
       } else {
+        dbg('watchdog', 'media 403: session inactive -> restart');
         restartStream('403');
       }
     }
