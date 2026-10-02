@@ -397,9 +397,16 @@
       if (now - DBG.lastSample > 5000) {
         DBG.lastSample = now;
         var buf2 = 0, end2 = 0;
-        try { if (v.buffered.length) { end2 = v.buffered.end(v.buffered.length - 1); buf2 = end2 - v.currentTime; } } catch (e) {}
+        try { if (v.buffered && v.buffered.length) { end2 = v.buffered.end(v.buffered.length - 1); buf2 = end2 - v.currentTime; } } catch (e) {}
         var agoOk = DBG.lastMediaOk ? Math.round((now - DBG.lastMediaOk) / 1000) + 's' : '-';
-        dbg('tick', 't=' + Math.round(v.currentTime) + ' end=' + Math.round(end2) + ' buf=' + Math.round(buf2) +
+        var pos = (v && typeof v.currentTime === 'number') ? v.currentTime : 0;
+        try {
+          if (window.webapis && webapis.avplay && typeof webapis.avplay.getCurrentTime === 'function') {
+            var ms = webapis.avplay.getCurrentTime();
+            if (typeof ms === 'number' && ms >= 0) pos = ms / 1000;
+          }
+        } catch (e) {}
+        dbg('tick', 't=' + Math.round(pos) + ' end=' + Math.round(end2) + ' buf=' + Math.round(buf2) +
           's rs=' + v.readyState + ' ns=' + v.networkState +
           ' seg=' + DBG.mediaOk + '/' + DBG.mediaFail + ' lastOk=' + agoOk);
       }
@@ -447,7 +454,7 @@
   // Прямой путь важен: публичные прокси (rte/ext) режут по ASN egress (548b),
   // а IP телевизора CDN не блокирует.
   var TIZEN_HEADERS = true;
-  var AVPLAY = { url: null, headers: null };
+  var AVPLAY = { url: null, headers: null, active: false };
 
   function tizenDirect() {
     return TIZEN_HEADERS && Lampa.Platform.is('tizen');
@@ -465,7 +472,7 @@
       webapis.avplay.open = function (url) {
         var res = open.apply(this, arguments);
         try {
-          if (AVPLAY.headers && AVPLAY.url && url === AVPLAY.url) {
+          if (AVPLAY.active && AVPLAY.headers) {
             webapis.avplay.setStreamingProperty('HTTP_HEADER', AVPLAY.headers);
             dbg('tizen', 'HTTP_HEADER set (' + AVPLAY.headers.split('\r\n').length + ' hdr)');
           }
@@ -1652,6 +1659,7 @@
           patchAvplay();
           AVPLAY.url = element.url;
           AVPLAY.headers = avplayHeaders(element);
+          AVPLAY.active = true;
         }
         markWatch(item);
         Lampa.Player.play(element);
@@ -1686,6 +1694,7 @@
       if (watchdog) { clearInterval(watchdog); watchdog = null; }
       currentPlay = null;
       triggerRecoveryFn = null;
+      AVPLAY.active = false;
       mediaSession.active = false;
       mediaSession.refreshing = false;
       Object.keys(hashReplacements).forEach(function (k) { delete hashReplacements[k]; });
@@ -1696,7 +1705,26 @@
       if (restarting || !currentPlay) return;
 
       var v = findMediaEl();
-      if (!v) { stopWatch(); return; }
+      var avplayPlaying = false;
+      var currentPos = -1;
+
+      try {
+        if (window.webapis && webapis.avplay) {
+          var st = '';
+          try { st = webapis.avplay.getState(); } catch (e) {}
+          if (st === 'PLAYING') avplayPlaying = true;
+          if (st === 'PLAYING' || st === 'PAUSED') {
+            var ms = webapis.avplay.getCurrentTime();
+            if (typeof ms === 'number' && ms >= 0) currentPos = ms / 1000;
+          }
+        }
+      } catch (e) {}
+
+      if (currentPos < 0 && v) {
+        currentPos = (typeof v.currentTime === 'number') ? v.currentTime : 0;
+      }
+
+      if (!v && !avplayPlaying && currentPos < 0) { stopWatch(); return; }
 
       // Упреждающее фоновое обновление токена/подписи: раз в 120 с (2 мин),
       // задолго до истечения 5-минутного TTL CDN.
@@ -1710,25 +1738,27 @@
 
       // Проверяем фатальные состояния медиа (ошибка декодера/сети, сброс источника emptied,
       // или аварийная пауза hls.js после сбоя сегмента).
-      var isDead = (v.error) || (v.networkState === 3) ||
-        (lastPos > 5 && v.currentTime === 0 && v.readyState === 0) ||
-        (v.paused && DBG.lastMediaFail && (Date.now() - DBG.lastMediaFail < 8000) && (Date.now() - DBG.lastMediaOk > 4000));
+      if (v) {
+        var isDead = (v.error) || (v.networkState === 3) ||
+          (lastPos > 5 && v.currentTime === 0 && v.readyState === 0) ||
+          (v.paused && DBG.lastMediaFail && (Date.now() - DBG.lastMediaFail < 8000) && (Date.now() - DBG.lastMediaOk > 4000));
 
-      if (isDead) {
-        dbg('watchdog', 'dead video state rs=' + v.readyState + ' ns=' + v.networkState +
-          ' p=' + v.paused + (v.error ? ' err=' + v.error.code : '') + ' -> restart');
-        restartStream('dead-state');
-        return;
+        if (isDead && !avplayPlaying) {
+          dbg('watchdog', 'dead video state rs=' + v.readyState + ' ns=' + v.networkState +
+            ' p=' + v.paused + (v.error ? ' err=' + v.error.code : '') + ' -> restart');
+          restartStream('dead-state');
+          return;
+        }
+
+        // Пауза/перемотка (настоящая пользовательская) — сбрасываем отсчёт.
+        if (v.paused || v.seeking) { lastPos = currentPos; lastPosAt = Date.now(); return; }
       }
 
-      // Пауза/перемотка (настоящая пользовательская) — сбрасываем отсчёт.
-      if (v.paused || v.seeking) { lastPos = v.currentTime; lastPosAt = Date.now(); return; }
+      if (currentPos > lastPos + 0.8) { lastPos = currentPos; lastPosAt = Date.now(); return; }
 
-      if (v.currentTime > lastPos + 0.8) { lastPos = v.currentTime; lastPosAt = Date.now(); return; }
-
-      if (Date.now() - lastPosAt > STALL_MS) {
+      if (Date.now() - lastPosAt > 15000) {
         lastPosAt = Date.now();
-        dbg('watchdog', 'stall t=' + Math.round(v.currentTime) + 's -> restart');
+        dbg('watchdog', 'stall t=' + Math.round(currentPos) + 's -> restart');
         restartStream('stall');
       }
     }
@@ -1786,20 +1816,24 @@
       var cp = currentPlay;
       var at = 0, dur = 0;
       try {
-        var v = findMediaEl();
-        at = v ? v.currentTime : 0;
-        dur = v ? (v.duration || 0) : 0;
+        if (window.webapis && webapis.avplay) {
+          try {
+            var ms = webapis.avplay.getCurrentTime();
+            if (typeof ms === 'number' && ms > 0) at = ms / 1000;
+            var dms = webapis.avplay.getDuration();
+            if (typeof dms === 'number' && dms > 0) dur = dms / 1000;
+          } catch (e) {}
+        }
+        if (!at || !dur) {
+          var v = findMediaEl();
+          if (v) {
+            if (!at) at = (typeof v.currentTime === 'number') ? v.currentTime : 0;
+            if (!dur) dur = (typeof v.duration === 'number') ? v.duration : 0;
+          }
+        }
       } catch (e) {}
 
       dbg('watchdog', 'restartStream reason=' + reason + ' at=' + Math.round(at) + 's dur=' + Math.round(dur) + 's');
-
-      // Прямой режим Tizen не поехал по НАСТОЯЩЕМУ стопу (поток так и не
-      // начался, currentTime ~0) — значит HTTP_HEADER не сработал: уходим на
-      // прокси. Откат только по 'stall', не по 403 (403 от парсера/проб — норма).
-      if (tizenDirect() && at < 5 && reason === 'stall') {
-        TIZEN_HEADERS = false;
-        dbg('tizen', 'прямой поток застопорился -> proxy');
-      }
 
       withLoader(function (stopLoad) {
         resolveStream(cp.item.iframe, token, 0).then(function (stream) {
@@ -1833,8 +1867,25 @@
               el.playlist = buildPlaylist(cp.playlist, cp.item, el);
             }
 
+            // Временно подавляем диалог Lampa «Продолжать просмотр с...»
+            var prevTimecodeSetting = null;
+            try {
+              prevTimecodeSetting = Lampa.Storage.get('player_timecode');
+              Lampa.Storage.set('player_timecode', 'continue');
+            } catch (e) {}
+
             initMediaSession(cp.item.iframe, cp.pick, token, chosen);
             play(el, cp.item);
+
+            setTimeout(function () {
+              try {
+                if (prevTimecodeSetting !== null) {
+                  Lampa.Storage.set('player_timecode', prevTimecodeSetting);
+                }
+                clearModals();
+              } catch (e) {}
+            }, 1200);
+
             restarting = false;
             lastPos = -1;
             lastPosAt = Date.now();
