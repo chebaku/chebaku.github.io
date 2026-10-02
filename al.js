@@ -24,9 +24,15 @@
     'https://proxy7.rte.net.ru/'
   ];
 
-  // Медиа-прокси: стабильные узлы rte первыми, ext.rte.net.ru:8443 (альтернативный egress)
-  // проверяется параллельно с ними через chooseProxy.
-  var MEDIA_PROXIES = API_PROXIES.concat(['https://ext.rte.net.ru:8443/']);
+  // Медиа-прокси: проверенные узлы proxy6 и ext.rte.net.ru:8443 первыми,
+  // остальные узлы rte проверяются параллельно с ними в chooseProxy.
+  var MEDIA_PROXIES = [
+    'https://proxy6.rte.net.ru/',
+    'https://ext.rte.net.ru:8443/',
+    'https://proxy5.rte.net.ru/',
+    'https://proxy4.rte.net.ru/',
+    'https://proxy7.rte.net.ru/'
+  ];
   var TIMEOUT = 15000;
 
   // Токен linkpp меняется, но живой. Если p.linkpp.ink не отдал Alloha —
@@ -263,6 +269,30 @@
     } catch (e) {}
 
     try {
+      if (window.Hls && window.Hls.prototype && !window.Hls.prototype.__alHooked) {
+        window.Hls.prototype.__alHooked = true;
+        var origOn = window.Hls.prototype.on;
+        window.Hls.prototype.on = function (event, handler) {
+          var errEv = (window.Hls.Events && window.Hls.Events.ERROR) || 'hlsError';
+          if (event === errEv) {
+            var origHandler = handler;
+            handler = function (ev, data) {
+              var details = data ? (data.details || data.type || '') : '';
+              var fatal = !!(data && data.fatal);
+              dbg('hls', 'hls.js error ' + details + (fatal ? ' fatal' : ''));
+              if (fatal) {
+                currentProxyBase = null;
+                triggerPlayerRecovery('hls-fatal: ' + details);
+              }
+              return origHandler.apply(this, arguments);
+            };
+          }
+          return origOn.call(this, event, handler);
+        };
+      }
+    } catch (e) {}
+
+    try {
       if (window.Lampa && Lampa.Player && Lampa.Player.listener && !Lampa.Player.__alHooked) {
         Lampa.Player.__alHooked = true;
         Lampa.Player.listener.follow('error', function (e) {
@@ -270,6 +300,7 @@
           var fatal = e && (e.fatal === true || e.fatal === 'true');
           dbg('player', 'Lampa.Player error: ' + details + (fatal ? ' fatal' : ''));
           if (fatal) {
+            currentProxyBase = null;
             triggerPlayerRecovery('player-fatal: ' + details);
           }
         });
@@ -508,11 +539,12 @@
   var proxyIndex = 0;
 
   // URL медиа-хопа через конкретный прокси (param/... добавляют заголовки).
+  // param/User-Agent намеренно не шлём: CDN vkvideo отдаёт x-vd: client_blocked (403),
+  // если видит подставленный браузерный UA с хостинг-ноды.
   function mediaProxyUrl(base, url, origin) {
     return base +
       'param/Origin=' + encodeURIComponent(origin) + '/' +
       'param/Referer=' + encodeURIComponent(origin + '/') + '/' +
-      'param/User-Agent=' + encodeURIComponent(UA) + '/' +
       url;
   }
 
@@ -526,8 +558,9 @@
   }
 
   // CDN Alloha блокирует часть IP (в т.ч. часть rte-нод) → медиа отдаёт 403.
-  // Перед выдачей потока проверяем прокси коротким запросом манифеста и
-  // закрепляем за потоком тот, что реально отвечает.
+  // Перед выдачей потока проверяем прокси коротким запросом манифеста. Если это
+  // master.m3u8 (#EXT-X-STREAM-INF), обязательно проверяем дочерний плейлист:
+  // CDN может пустить на мастер, но заблокировать индексный плейлист (как proxy5).
   function probeOnce(base, url, origin) {
     return new Promise(function (resolve) {
       var network = new Lampa.Reguest();
@@ -535,7 +568,34 @@
       probing++;
       var done = function (v) { probing--; if (probing < 0) probing = 0; resolve(v); };
       network.silent(mediaProxyUrl(base, url, origin), function (data) {
-        done(!!data);
+        if (!data) return done(false);
+        if (typeof data === 'string' && data.indexOf('#EXT-X-STREAM-INF') !== -1) {
+          var lines = data.split('\n');
+          var childPath = null;
+          for (var i = 0; i < lines.length; i++) {
+            var line = lines[i].trim();
+            if (line && line.indexOf('#') !== 0) {
+              childPath = line;
+              break;
+            }
+          }
+          if (childPath) {
+            var childUrl = (function () {
+              try { return new URL(childPath, url).href; } catch (e) { return null; }
+            })();
+            if (childUrl) {
+              var netChild = new Lampa.Reguest();
+              netChild.timeout(3000);
+              netChild.silent(mediaProxyUrl(base, childUrl, origin), function (subData) {
+                done(!!subData && String(subData).indexOf('#EXTINF') !== -1);
+              }, function () {
+                done(false);
+              }, false, { dataType: 'text' });
+              return;
+            }
+          }
+        }
+        done(true);
       }, function () {
         done(false);
       }, false, {
@@ -563,8 +623,9 @@
             failed++;
             if (failed >= total && !done) {
               done = true;
-              var fallback = currentProxyBase || MEDIA_PROXIES[0];
-              dbg('proxy', 'все пробы 403 → играю через ' + hostOf(fallback) + ' без пробы');
+              currentProxyBase = null;
+              var fallback = MEDIA_PROXIES[0];
+              dbg('proxy', 'все пробы 403 → fallback ' + hostOf(fallback));
               resolve(fallback);
             }
           }
@@ -583,6 +644,7 @@
           dbg('proxy', 'сохранён рабочий ' + hostOf(currentProxyBase));
           return currentProxyBase;
         }
+        currentProxyBase = null;
         return parallelChooseProxy(url, origin);
       });
     }
@@ -1729,11 +1791,17 @@
     function restartStream(reason) {
       if (restarting || !currentPlay) return;
       restarting = true;
+      currentProxyBase = null;
 
-      try {
-        if (window.Lampa && Lampa.Modal && typeof Lampa.Modal.close === 'function') Lampa.Modal.close();
-        $('.player-error').remove();
-      } catch (e) {}
+      function clearModals() {
+        try {
+          if (window.Lampa && Lampa.Modal && typeof Lampa.Modal.close === 'function') Lampa.Modal.close();
+          $('.player-error').remove();
+        } catch (e) {}
+      }
+      clearModals();
+      setTimeout(clearModals, 200);
+      setTimeout(clearModals, 600);
 
       var cp = currentPlay;
       var at = 0, dur = 0;
