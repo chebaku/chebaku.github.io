@@ -1522,11 +1522,17 @@
       withLoader(function (stopLoad) {
         resolveStream(item.iframe, token, PLAY_TTL).then(function (stream) {
           stopLoad();
-          if (!stream) { Lampa.Noty.show('Нет ссылки на поток'); return; }
+          if (!stream) {
+            Lampa.Noty.show('Поток недоступен (' + item.title + ')');
+            return;
+          }
 
           var chosen = pickTrack(stream, item.title);
           buildElement(stream, chosen, item, hash).then(function (element) {
-            if (!element) { Lampa.Noty.show('Нет ссылки на поток'); return; }
+            if (!element) {
+              Lampa.Noty.show('Нет ссылки на поток');
+              return;
+            }
 
             beginWatch(item, hash, item.title, null);
             play(element, item);
@@ -1712,7 +1718,7 @@
         resolveStream(item.iframe, token, PLAY_TTL).then(function (stream) {
           stopLoad();
           if (!stream) {
-            Lampa.Noty.show('Нет ссылки на поток');
+            Lampa.Noty.show('Поток серии недоступен (' + item.voice + ')');
             return;
           }
 
@@ -1754,7 +1760,7 @@
             resolveStream(entry.iframe, token, PLAY_TTL).then(function (stream) {
               if (!stream) {
                 cell.url = '';
-                Lampa.Noty.show('Нет ссылки на поток');
+                Lampa.Noty.show('Поток серии недоступен (' + entry.sub + ')');
                 call();
                 return;
               }
@@ -1836,7 +1842,7 @@
     // --- Запуск ------------------------------------------------------------
 
     function discoverToken(kp) {
-      return req(API_PLAYERS + kp, 'text', { 'User-Agent': UA, Referer: LINKPP_REFERER }).then(function (data) {
+      return withTimeout(req(API_PLAYERS + kp, 'text', { 'User-Agent': UA, Referer: LINKPP_REFERER }).then(function (data) {
         var json = asObject(data);
         var list = (json && json.data) || [];
         var alloha = list.filter(function (p) { return p && p.type === 'Alloha'; })[0];
@@ -1844,7 +1850,7 @@
           (alloha.translations && alloha.translations[0] && alloha.translations[0].iframeUrl));
         if (!url) return null;
         try { return new URL(url).searchParams.get('token'); } catch (e) { return null; }
-      });
+      }), 4000);
     }
 
     function loadMeta(tok, kp) {
