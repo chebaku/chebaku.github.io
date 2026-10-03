@@ -163,6 +163,24 @@
     return s.replace(/\[[\d,]*\]\.mp4/i, '%s.mp4');
   }
 
+  // Filmix CDN отдаёт реальные 2K (1440p) и 4K (2160p) без кэпа и 10-секундных промо-заглушек
+  // через HLS: https://<host>/hls/<path>/index.m3u8?hash=<hash>
+  function buildHlsUrl(link, q) {
+    var m = String(link || '').match(/^(https?:\/\/[^\/]+)\/s\/([^\/]+)\/(.*)/);
+    if (!m) return null;
+    var host = m[1];
+    var hash = m[2];
+    var rest = m[3].replace(/\?.*$/, '');
+    var path = rest.replace(/\[[\d,]*\]\.mp4/i, q + '.mp4').replace(/%s\.mp4/i, q + '.mp4');
+    return host + '/hls/' + path + '/index.m3u8?hash=' + hash;
+  }
+
+  function buildQualityUrl(link, q) {
+    var hls = buildHlsUrl(link, q);
+    if (hls) return hls;
+    return fileTmpl(link).replace('%s', q);
+  }
+
   function qualitiesOf(file) {
     var q = (file && file.qualities ? file.qualities : []).map(function (x) { return parseInt(x, 10); })
       .filter(function (n) { return n > 0; });
@@ -176,8 +194,11 @@
 
   function defaultQuality(list) {
     if (!list || !list.length) return null;
-    var safe = list.filter(function (n) { return n <= 1080; }).sort(function (a, b) { return a - b; });
-    return safe.length ? safe[safe.length - 1] : Math.max.apply(null, list);
+    var pref = 1080;
+    try { pref = parseInt(Lampa.Storage.get('video_quality_default', '1080'), 10) || 1080; } catch (e) {}
+    var matched = list.filter(function (n) { return n <= pref; }).sort(function (a, b) { return a - b; });
+    if (matched.length) return matched[matched.length - 1];
+    return list[0];
   }
 
   // player_links -> модель { movies: [...] } либо { seasons: [...] }.
@@ -399,16 +420,13 @@
       var qualities = qualitiesOf(file);
       if (!qualities.length) return null;
 
-      var tmpl = fileTmpl(file.link);
-      if (tmpl.indexOf('%s') === -1) return null;
-
       var best = defaultQuality(qualities);
       var qmap = {};
-      qualities.forEach(function (q) { qmap[q + 'p'] = proxMedia(tmpl.replace('%s', q)); });
+      qualities.forEach(function (q) { qmap[q + 'p'] = proxMedia(buildQualityUrl(file.link, q)); });
 
       var element = {
         title: opts.title,
-        url: proxMedia(tmpl.replace('%s', best)),
+        url: proxMedia(buildQualityUrl(file.link, best)),
         quality: qmap,
         headers: { 'User-Agent': API_UA },
         timeline: opts.timeline,
@@ -880,6 +898,8 @@
     window.filmix_debug = {
       bracketQualities: bracketQualities,
       fileTmpl: fileTmpl,
+      buildHlsUrl: buildHlsUrl,
+      buildQualityUrl: buildQualityUrl,
       qualitiesOf: qualitiesOf,
       buildModel: buildModel,
       defaultQuality: defaultQuality,
