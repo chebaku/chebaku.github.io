@@ -23,8 +23,7 @@
   var API_UA = 'okhttp/3.10.0';
   var DEV_TOKEN = 'aaaabbbbccccddddeeeeffffaaaabbbb';
 
-  var proxyIndex = 0;
-  var preferProxy = false;
+  var currentProxyIndex = 0;
 
   function randomHex(n) {
     var s = '';
@@ -49,8 +48,7 @@
 
   // --- Прокси --------------------------------------------------------------
 
-  function wrap(url, params) {
-    var base = PROXIES[proxyIndex++ % PROXIES.length];
+  function proxyUrl(base, url, params) {
     var pre = '';
     (params || []).forEach(function (p) {
       pre += 'param/' + p[0] + '=' + encodeURIComponent(p[1]) + '/';
@@ -63,16 +61,25 @@
   }
 
   function apiParams() {
-    return Lampa.Platform.is('android') ? [] : [['User-Agent', API_UA]];
+    return [['User-Agent', API_UA]];
   }
 
   var API_HEADERS = { 'User-Agent': API_UA };
 
   function orderFor(url, params) {
-    if (Lampa.Platform.is('android')) return [url];
-
-    var proxied = PROXIES.map(function () { return wrap(url, params); });
-    return (preferProxy ? proxied : [url]).concat(preferProxy ? [] : proxied);
+    var p = params || apiParams();
+    var list = [];
+    for (var i = 0; i < PROXIES.length; i++) {
+      list.push(PROXIES[(currentProxyIndex + i) % PROXIES.length]);
+    }
+    var proxied = list.map(function (base) { return proxyUrl(base, url, p); });
+    // Браузеры (Tizen, WebOS, ПК) блокируют заголовок User-Agent в XHR и HTTP (Mixed Content).
+    // Без okhttp/3.10.0 Filmix возвращает 200 OK с пустыми player_links.movie/playlist ([]).
+    // Поэтому запросы к API Filmix на браузерных платформах ВСЕГДА идут через HTTPS-прокси.
+    if (Lampa.Platform.is('android')) {
+      return proxied.concat([url]);
+    }
+    return proxied;
   }
 
   function netOne(url, headers, post, dataType) {
@@ -83,7 +90,7 @@
         resolve(data);
       }, function () {
         resolve(null);
-      }, post || false, {
+      }, post ? post : false, {
         dataType: dataType || 'text',
         headers: headers || {}
       });
@@ -95,7 +102,20 @@
       return chain.then(function (result) {
         if (result) return result;
         return netOne(candidate, headers, post).then(function (data) {
-          if (data && isProxy(candidate)) preferProxy = true;
+          if (!data) return null;
+          var obj = asObject(data);
+          if (obj) {
+            // Троттлинг API Filmix или ошибка
+            if (obj.message === null && !obj.id) return null;
+            if (obj.error) return null;
+            for (var p = 0; p < PROXIES.length; p++) {
+              if (candidate.indexOf(PROXIES[p]) === 0) {
+                currentProxyIndex = p;
+                break;
+              }
+            }
+            return obj;
+          }
           return data;
         });
       });
@@ -112,13 +132,14 @@
     return req(url, apiParams()).then(asObject);
   }
 
-  // Медиа: на Android ссылка как есть (UA шлёт сам), на Tizen/веб — через прокси
-  // с подстановкой User-Agent.
+  function fixProto(url) {
+    if (!url) return '';
+    return String(url).replace(/^http:\/\//i, 'https://');
+  }
+
   function proxMedia(url) {
     if (!url) return url;
-    if (Lampa.Platform.is('android')) return url;
-    if (isProxy(url)) return url;
-    return wrap(url, [['User-Agent', API_UA]]);
+    return fixProto(url);
   }
 
   // --- Утилиты -------------------------------------------------------------
@@ -168,7 +189,7 @@
   function buildHlsUrl(link, q) {
     var m = String(link || '').match(/^(https?:\/\/[^\/]+)\/s\/([^\/]+)\/(.*)/);
     if (!m) return null;
-    var host = m[1];
+    var host = fixProto(m[1]);
     var hash = m[2];
     var rest = m[3].replace(/\?.*$/, '');
     var path = rest.replace(/\[[\d,]*\]\.mp4/i, q + '.mp4').replace(/%s\.mp4/i, q + '.mp4');
@@ -178,7 +199,7 @@
   function buildQualityUrl(link, q) {
     var hls = buildHlsUrl(link, q);
     if (hls) return hls;
-    return fileTmpl(link).replace('%s', q);
+    return fixProto(fileTmpl(link).replace('%s', q));
   }
 
   function qualitiesOf(file) {
@@ -259,6 +280,10 @@
 
   function norm(s) {
     return String(s == null ? '' : s).toLowerCase().replace(/[^a-zа-яё0-9]+/gi, ' ').trim();
+  }
+
+  function cleanTitle(s) {
+    return String(s || '').replace(/[\s.,:;’'`!?+\-]+/g, ' ').replace(/\s+/g, ' ').trim();
   }
 
   function timeText(seconds) {
@@ -666,7 +691,7 @@
         withLoader(function (stopLoad) {
           apiGet('post/' + id).then(function (post) {
             stopLoad();
-            if (post) gotAny = true;
+            if (post && post.id) gotAny = true;
             if (post && openPost(id, post)) return;
             next();
           });
@@ -763,15 +788,36 @@
         } catch (e) {}
       }
 
-      var query = object.search || object.movie.title || object.movie.name || '';
+      var movie = object.movie || {};
+      var qPrimary = object.search || movie.title || movie.name || '';
+      var qClean = cleanTitle(qPrimary);
+      var qAlt = movie.original_title || movie.original_name || '';
+
+      var queryList = [];
+      if (qPrimary) queryList.push(qPrimary);
+      if (qClean && qClean !== qPrimary) queryList.push(qClean);
+      if (qAlt && qAlt !== qPrimary && qAlt !== qClean) queryList.push(qAlt);
 
       load('Поиск…');
 
-      apiGet('search', 'story=' + encodeURIComponent(query)).then(function (list) {
-        loadDone();
-        if (!list || !list.length || !list.forEach) { status('Ничего не найдено'); return; }
-        pickAndLoad(list);
-      });
+      function trySearch(idx) {
+        if (idx >= queryList.length) {
+          loadDone();
+          status('Ничего не найдено');
+          return;
+        }
+        var q = queryList[idx];
+        apiGet('search', 'story=' + encodeURIComponent(q)).then(function (list) {
+          if (list && list.length && list.forEach) {
+            loadDone();
+            pickAndLoad(list);
+          } else {
+            trySearch(idx + 1);
+          }
+        });
+      }
+
+      trySearch(0);
     };
 
     this.start = function () {
