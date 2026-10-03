@@ -443,54 +443,16 @@
     });
   } catch (e) {}
 
-  // --- Tizen: прямой поток + заголовок Origin через AVPlay -----------------
+  // --- Прямой стриминг / медиа-прокси --------------------------------------
   //
-  // CDN требует Origin плеера. На Tizen Lampa вызывает webapis.avplay.open(url)
-  // без заголовков, а из JS Origin не выставить. Но AVPlay умеет
-  // setStreamingProperty('HTTP_HEADER', ...) — патчим open и подставляем
-  // Origin/Referer/User-Agent для нашей ссылки. Если прошивка не поддерживает —
-  // сторож (restartStream при раннем стопе) отключит режим и уйдёт на прокси.
-  //
-  // Прямой путь важен: публичные прокси (rte/ext) режут по ASN egress (548b),
-  // а IP телевизора CDN не блокирует.
-  var TIZEN_HEADERS = true;
-  var AVPLAY = { url: null, headers: null, active: false };
-
-  function tizenDirect() {
-    return TIZEN_HEADERS && Lampa.Platform.is('tizen');
-  }
-
+  // CDN Alloha (*.vkvideo.cloud) отдаёт поток только с заголовком Origin плеера,
+  // иначе 403. На Android Lampa играет через нативный ExoPlayer и передаёт
+  // element.headers сама. На остальных платформах (Tizen, WebOS, Browser) браузер
+  // и медиадвижки не позволяют JS слать произвольный Origin на CDN (на Tizen
+  // AVPlay метод setStreamingProperty('HTTP_HEADER') не поддерживается и вызывает
+  // TypeMismatchError). Поэтому для них поток обязательно заворачивается в медиапрокси.
   function directPlatform() {
-    return Lampa.Platform.is('android') || tizenDirect();
-  }
-
-  function patchAvplay() {
-    try {
-      if (!(window.webapis && webapis.avplay) || webapis.avplay.__alPatched) return;
-      var open = webapis.avplay.open;
-      webapis.avplay.__alPatched = true;
-      webapis.avplay.open = function (url) {
-        var res = open.apply(this, arguments);
-        try {
-          if (AVPLAY.active && AVPLAY.headers) {
-            webapis.avplay.setStreamingProperty('HTTP_HEADER', AVPLAY.headers);
-            dbg('tizen', 'HTTP_HEADER set (' + AVPLAY.headers.split('\r\n').length + ' hdr)');
-          }
-        } catch (e) {
-          dbg('tizen', 'HTTP_HEADER FAIL: ' + (e && e.message));
-        }
-        return res;
-      };
-    } catch (e) {}
-  }
-
-  function avplayHeaders(element) {
-    var h = (element && element.headers) || {};
-    var parts = [];
-    if (h.Origin) parts.push('Origin: ' + h.Origin);
-    if (h.Referer) parts.push('Referer: ' + h.Referer);
-    parts.push('User-Agent: ' + (h['User-Agent'] || UA));
-    return parts.join('\r\n');
+    return Lampa.Platform.is('android');
   }
 
   // На Tizen плеер Lampa — это <object type="application/avplayer">, не <video>;
@@ -1652,15 +1614,9 @@
         var plat = (Lampa.Platform && Lampa.Platform.get) ? Lampa.Platform.get() : '?';
         dbg('play', 'host=' + hostOf(element.url) + ' q=' + Object.keys(element.quality || {}).length +
           ' subs=' + ((element.subtitles || []).length) + ' urlLen=' + String(element.url || '').length +
-          ' platform=' + plat + (tizenDirect() ? ' tizen=headers' : ''));
+          ' platform=' + plat);
         dbgWatchVideo();
 
-        if (tizenDirect()) {
-          patchAvplay();
-          AVPLAY.url = element.url;
-          AVPLAY.headers = avplayHeaders(element);
-          AVPLAY.active = true;
-        }
         markWatch(item);
         Lampa.Player.play(element);
         if (element.playlist) Lampa.Player.playlist(element.playlist);
@@ -1694,7 +1650,6 @@
       if (watchdog) { clearInterval(watchdog); watchdog = null; }
       currentPlay = null;
       triggerRecoveryFn = null;
-      AVPLAY.active = false;
       mediaSession.active = false;
       mediaSession.refreshing = false;
       Object.keys(hashReplacements).forEach(function (k) { delete hashReplacements[k]; });
@@ -2475,7 +2430,6 @@
 
     injectStyles();
     dbgHookNet();
-    patchAvplay();
     if (dbgEnabled()) { dbgEnsure(); dbg('diag', 'plugin start ' + locInfo()); }
     Lampa.Component.add('alloha', Alloha);
 
