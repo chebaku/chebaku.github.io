@@ -202,6 +202,70 @@
     return fixProto(fileTmpl(link).replace('%s', q));
   }
 
+  function buildHlsMasterUrl(link, q) {
+    var m = String(link || '').match(/^(https?:\/\/[^\/]+)\/s\/([^\/]+)\/(.*)/);
+    if (!m) return null;
+    var host = fixProto(m[1]);
+    var hash = m[2];
+    var rest = m[3].replace(/\?.*$/, '');
+    var path = rest.replace(/\[[\d,]*\]\.mp4/i, q + '.mp4').replace(/%s\.mp4/i, q + '.mp4');
+    return host + '/hls/' + path + '/master.m3u8?hash=' + hash;
+  }
+
+  function formatChannels(channels) {
+    var c = parseInt(channels, 10);
+    if (c === 6) return '5.1';
+    if (c === 8) return '7.1';
+    if (c === 2) return '2.0';
+    if (c === 1) return '1.0';
+    return c ? c + ' ch' : '';
+  }
+
+  function rewriteMaster(text, hash) {
+    if (!text || text.indexOf('#EXT-X-MEDIA:TYPE=AUDIO') === -1) return null;
+
+    return text.replace(/#EXT-X-MEDIA:TYPE=AUDIO[^\n]+/g, function (line) {
+      var nameMatch = line.match(/NAME="([^"]+)"/);
+      var chanMatch = line.match(/CHANNELS="([^"]+)"/);
+      var uriMatch = line.match(/URI="([^"]+)"/);
+
+      if (!uriMatch) return line;
+
+      var name = nameMatch ? nameMatch[1] : '';
+      var chan = chanMatch ? formatChannels(chanMatch[1]) : '';
+      var newName = name;
+
+      // Приводим название к красивому виду с указанием каналов: Русский (5.1), Українська (5.1)
+      if (chan && newName.indexOf(chan) === -1) {
+        newName += ' (' + chan + ')';
+      }
+
+      var uri = uriMatch[1];
+      if (uri.indexOf('?hash=') === -1) {
+        uri += '?hash=' + hash;
+      }
+
+      var out = line;
+      if (nameMatch) out = out.replace(/NAME="[^"]+"/, 'NAME="' + newName + '"');
+      out = out.replace(/URI="[^"]+"/, 'URI="' + uri + '"');
+      return out;
+    }).replace(/^(https?:\/\/[^\s\n"]+\.m3u8)$/gm, function (line) {
+      return line.indexOf('?hash=') === -1 ? line + '?hash=' + hash : line;
+    });
+  }
+
+  function makePlayableManifest(text) {
+    try {
+      if (typeof window !== 'undefined' && window.URL && window.Blob) {
+        return URL.createObjectURL(new Blob([text], { type: 'application/vnd.apple.mpegurl' }));
+      }
+    } catch (e) {}
+    try {
+      return 'data:application/vnd.apple.mpegurl;charset=utf-8;base64,' + btoa(unescape(encodeURIComponent(text)));
+    } catch (e) {}
+    return null;
+  }
+
   function qualitiesOf(file) {
     var q = (file && file.qualities ? file.qualities : []).map(function (x) { return parseInt(x, 10); })
       .filter(function (n) { return n > 0; });
@@ -466,6 +530,36 @@
       return element;
     }
 
+    function prepareElement(file, opts) {
+      var element = buildElement(file, opts);
+      if (!element) return Promise.resolve(null);
+
+      var qualities = qualitiesOf(file);
+      var best = defaultQuality(qualities);
+      var masterUrl = buildHlsMasterUrl(file.link, best);
+      var m = String(file.link || '').match(/^(https?:\/\/[^\/]+)\/s\/([^\/]+)\/(.*)/);
+      var hash = m ? m[2] : '';
+
+      if (!masterUrl || !hash) return Promise.resolve(element);
+
+      return new Promise(function (resolve) {
+        var network = new Lampa.Reguest();
+        network.timeout(3000);
+        network.silent(masterUrl, function (text) {
+          if (text && typeof text === 'string') {
+            var rewritten = rewriteMaster(text, hash);
+            if (rewritten) {
+              var playUrl = makePlayableManifest(rewritten);
+              if (playUrl) element.url = playUrl;
+            }
+          }
+          resolve(element);
+        }, function () {
+          resolve(element);
+        }, false, { dataType: 'text' });
+      });
+    }
+
     function play(element, item) {
       try {
         markWatch(item);
@@ -480,14 +574,15 @@
     function playMovie(item) {
       withLoader(function (stopLoad) {
         apiGet('post/' + postId).then(function (post) {
-          stopLoad();
           var pl = (post && post.player_links && post.player_links.movie) || {};
           var file = pl[item.key];
-          if (!file) { Lampa.Noty.show('Ссылка недоступна'); return; }
+          if (!file) { stopLoad(); Lampa.Noty.show('Ссылка недоступна'); return; }
 
-          var element = buildElement(file, { title: movieTitle() + ' · ' + item.translation, duration: durationSeconds(post.duration) });
-          if (!element) { Lampa.Noty.show('Нет ссылки на поток'); return; }
-          play(element, {});
+          prepareElement(file, { title: movieTitle() + ' · ' + item.translation, duration: durationSeconds(post.duration) }).then(function (element) {
+            stopLoad();
+            if (!element) { Lampa.Noty.show('Нет ссылки на поток'); return; }
+            play(element, {});
+          });
         });
       });
     }
@@ -598,22 +693,23 @@
     function playEpisode(season, voice, ep, hash) {
       withLoader(function (stopLoad) {
         apiGet('post/' + postId).then(function (post) {
-          stopLoad();
           var pl = (post && post.player_links && post.player_links.playlist) || {};
           var s = pl[season.id];
           var v = s && s[voice.id];
           var file = v && v[ep.id];
-          if (!file) { Lampa.Noty.show('Ссылка недоступна'); return; }
+          if (!file) { stopLoad(); Lampa.Noty.show('Ссылка недоступна'); return; }
 
-          var element = buildElement(file, {
+          prepareElement(file, {
             title: movieTitle() + ' S' + season.number + 'E' + ep.number,
             timeline: timelineFor(season.number, ep.number),
             duration: durationSeconds(post.duration),
             season: season.number,
             episode: ep.number
+          }).then(function (element) {
+            stopLoad();
+            if (!element) { Lampa.Noty.show('Нет ссылки на поток'); return; }
+            play(element, { season: season.number, episode: ep.number });
           });
-          if (!element) { Lampa.Noty.show('Нет ссылки на поток'); return; }
-          play(element, { season: season.number, episode: ep.number });
         });
       });
     }
@@ -951,7 +1047,10 @@
       defaultQuality: defaultQuality,
       norm: norm,
       durationSeconds: durationSeconds,
-      apiToken: apiToken
+      apiToken: apiToken,
+      formatChannels: formatChannels,
+      rewriteMaster: rewriteMaster,
+      buildHlsMasterUrl: buildHlsMasterUrl
     };
   }
 
