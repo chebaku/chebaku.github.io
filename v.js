@@ -258,10 +258,81 @@
     function cleanTitle(str) {
         if (!str) return '';
         return str
-            .replace(/[.,:;!?&%$#@*()\[\]{}"'\\/`~^_+=]/g, ' ')
+            .replace(/[.,:;!?&%$#@*()\[\]{}"'\\/`~^_+=|—–-]/g, ' ')
             .replace(/\s+/g, ' ')
             .trim();
     }
+
+    function getWordStem(word) {
+        if (!word) return '';
+        if (word.length <= 3) return word;
+        return word.replace(/(?:ами|ями|ого|его|ому|ему|ыми|ими|ую|юю|ое|ее|ие|ые|ов|ев|ей|ам|ям|ом|ем|ах|ях|ть|ти|ла|ло|ли|ет|ут|ют|ит|ат|ят|ся|сь|ки|ок|ка|ке|ку|ой|ей|ия|ии|ию|ий|ый|а|я|у|ю|о|е|ы|и|s|es|ed|ing)$/i, '');
+    }
+
+    function matchTitleText(videoTitle, targetTitle, targetOrigTitle) {
+        if (!videoTitle) return false;
+        var vClean = cleanTitle(videoTitle).toLowerCase();
+        var vWords = vClean.split(' ').filter(Boolean);
+        var vStems = vWords.map(getWordStem);
+
+        function matchTarget(t) {
+            if (!t) return false;
+            var tClean = cleanTitle(t).toLowerCase();
+            var tWords = tClean.split(' ').filter(Boolean);
+            if (tWords.length === 0) return false;
+
+            var textWords = tWords.filter(function (w) {
+                return !/^\d+$/.test(w) && !/^(?:в|на|с|и|к|о|по|из|за|the|a|an|of|in|on|at|to|for)$/i.test(w);
+            });
+            var numWords = tWords.filter(function (w) { return /^\d+$/.test(w); });
+
+            if (textWords.length === 0) {
+                return numWords.every(function (n) { return vWords.indexOf(n) !== -1; });
+            }
+
+            var matchedTextCount = textWords.filter(function (w) {
+                var stem = getWordStem(w);
+                if (stem.length <= 2) return vWords.indexOf(w) !== -1;
+                return vStems.some(function (vs) { return vs.indexOf(stem) !== -1 || stem.indexOf(vs) !== -1; }) ||
+                       vWords.some(function (vw) { return vw.indexOf(stem) !== -1 || stem.indexOf(vw) !== -1; });
+            }).length;
+
+            if (textWords.length === 1) {
+                if (matchedTextCount !== 1) return false;
+                if (numWords.length > 0 && !numWords.some(function (n) { return vWords.indexOf(n) !== -1; })) return false;
+                return true;
+            }
+
+            var ratio = matchedTextCount / textWords.length;
+            if (ratio < 0.6) return false;
+
+            if (numWords.length > 0) {
+                var targetNum = numWords[0];
+                var videoNums = vWords.filter(function (w) { return /^\d+$/.test(w) && w.length <= 2; });
+                if (videoNums.length > 0 && videoNums.indexOf(targetNum) === -1) {
+                    return false;
+                }
+            }
+
+            return true;
+        }
+
+        return matchTarget(targetTitle) || matchTarget(targetOrigTitle);
+    }
+
+    function isMovieRelevant(videoTitle, targetTitle, targetOrigTitle) {
+        if (!videoTitle) return false;
+        if (NOISE_REG.test(videoTitle)) return false;
+        if (/(?:сезон|серия|серий|эпизод|season|episode|s\d+e\d+)/i.test(videoTitle)) return false;
+        return matchTitleText(videoTitle, targetTitle, targetOrigTitle);
+    }
+
+    function isSerialRelevant(videoTitle, targetTitle, targetOrigTitle) {
+        if (!videoTitle) return false;
+        if (NOISE_REG.test(videoTitle)) return false;
+        return matchTitleText(videoTitle, targetTitle, targetOrigTitle);
+    }
+
 
     function formatTime(sec) {
         if (!sec) return '';
@@ -664,6 +735,7 @@
                     if (!v || !v.files) return;
                     if (NOISE_REG.test(v.title)) return;
                     if (v.duration < 300) return; // меньше 5 минут
+                    if (!isSerialRelevant(v.title, movie.name || movie.title, movie.original_name || movie.original_title)) return;
 
                     var q_info = extractQualities(v.files);
                     if (!q_info.default_url) return;
@@ -810,6 +882,7 @@
                 videos.forEach(function (item) {
                     var v = item && item.video;
                     if (v && v.files && !NOISE_REG.test(v.title) && v.duration >= 300) {
+                        if (!isSerialRelevant(v.title, movie.name || movie.title, movie.original_name || movie.original_title)) return;
                         var q_info = extractQualities(v.files);
                         if (!q_info.default_url) return;
 
@@ -946,7 +1019,7 @@
 
             display_episodes.forEach(function (ep, index) {
                 var ep_title = 'Серия ' + ep.episode;
-                var badges = '<span style="background: #0077FF; color: #fff; padding: 0.1em 0.4em; border-radius: 0.3em; margin-right: 0.4em; font-size: 0.85em;">' + ep.max_quality + '</span>';
+                var badges = '<span style="background: #0077FF; color: #fff; padding: 0.1em 0.4em; border-radius: 0.3em; margin-right: 0.4em; font-size: 0.85em; font-weight: 600;">' + ep.max_quality + '</span>';
 
                 if (ep.is_segmented) {
                     badges += '<span style="background: #FF9800; color: #fff; padding: 0.1em 0.4em; border-radius: 0.3em; margin-right: 0.4em; font-size: 0.85em; font-weight: 600;">⏱️ Таймкод</span>';
@@ -1008,6 +1081,7 @@
                     if (!v || !v.files) return;
                     if (NOISE_REG.test(v.title)) return;
                     if (v.duration < 2400) return; // фильмы длиннее 40 минут
+                    if (!isMovieRelevant(v.title, movie.title || movie.name, movie.original_title || movie.original_name)) return;
 
                     var q_info = extractQualities(v.files);
                     if (!q_info.default_url) return;
@@ -1044,7 +1118,7 @@
                 _this.loading(false);
 
                 filtered.forEach(function (m_item) {
-                    var m_badges = '<span style="background: #0077FF; color: #fff; padding: 0.1em 0.4em; border-radius: 0.3em; margin-right: 0.4em; font-size: 0.85em;">' + m_item.max_quality + '</span>';
+                    var m_badges = '<span style="background: #0077FF; color: #fff; padding: 0.1em 0.4em; border-radius: 0.3em; margin-right: 0.4em; font-size: 0.85em; font-weight: 600;">' + m_item.max_quality + '</span>';
                     if (m_item.has_segments) {
                         m_badges += '<span style="background: #FF9800; color: #fff; padding: 0.1em 0.4em; border-radius: 0.3em; margin-right: 0.4em; font-size: 0.85em; font-weight: 600;">⏱️ Таймкоды</span>';
                     }
