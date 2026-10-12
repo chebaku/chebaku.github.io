@@ -200,8 +200,10 @@
     // ==========================================
     // Шаблоны карточек Lampa
     // ==========================================
+    var templates_inited = false;
     function initTemplates() {
-        if (Lampa.Template.has('rutube_item')) return;
+        if (templates_inited) return;
+        templates_inited = true;
 
         Lampa.Template.add('rutube_item', `
             <div class="online selector">
@@ -709,6 +711,7 @@
     // Регистрация плагина и кнопки в карточке Lampa
     // ==========================================
     function startPlugin() {
+        initTemplates();
         // Регистрация компонента
         Lampa.Component.add('rutube_view', RutubeComponent);
 

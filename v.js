@@ -302,8 +302,10 @@
     // ==========================================
     // Шаблоны карточек Lampa
     // ==========================================
+    var templates_inited = false;
     function initTemplates() {
-        if (Lampa.Template.has('vk_item')) return;
+        if (templates_inited) return;
+        templates_inited = true;
 
         Lampa.Template.add('vk_item', `
             <div class="online selector">
@@ -815,6 +817,7 @@
     // Регистрация плагина и кнопки в карточке Lampa
     // ==========================================
     function startPlugin() {
+        initTemplates();
         Lampa.Component.add('vk_view', VkComponent);
 
         Lampa.Listener.follow('full', function (e) {
