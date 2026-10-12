@@ -272,6 +272,159 @@
         return m + ' мин';
     }
 
+    function formatTimecode(sec) {
+        if (!sec && sec !== 0) return '00:00';
+        var s = Math.floor(sec % 60);
+        var m = Math.floor((sec / 60) % 60);
+        var h = Math.floor(sec / 3600);
+        var pad = function (n) { return (n < 10 ? '0' : '') + n; };
+        if (h > 0) {
+            return h + ':' + pad(m) + ':' + pad(s);
+        }
+        return pad(m) + ':' + pad(s);
+    }
+
+    function parseTimecodeToSeconds(time_str) {
+        if (!time_str) return 0;
+        var parts = time_str.trim().split(':').map(function (p) { return parseInt(p, 10) || 0; });
+        if (parts.length === 3) {
+            return parts[0] * 3600 + parts[1] * 60 + parts[2];
+        } else if (parts.length === 2) {
+            return parts[0] * 60 + parts[1];
+        }
+        return 0;
+    }
+
+    function extractSegmentsFromVideo(v) {
+        if (!v) return null;
+
+        // 1. Из массива episodes от VK API
+        if (Array.isArray(v.episodes) && v.episodes.length > 1) {
+            var segs = [];
+            for (var i = 0; i < v.episodes.length; i++) {
+                var ep_item = v.episodes[i];
+                if (typeof ep_item.time === 'number') {
+                    var next_time = (i + 1 < v.episodes.length && typeof v.episodes[i + 1].time === 'number')
+                        ? v.episodes[i + 1].time
+                        : (v.duration || (ep_item.time + 3600));
+                    segs.push({
+                        text: ep_item.text || ('Серия ' + (i + 1)),
+                        time: ep_item.time,
+                        duration: Math.max(0, next_time - ep_item.time)
+                    });
+                }
+            }
+            if (segs.length > 1) return segs;
+        }
+
+        // 2. Из описания видео по таймкодам
+        if (v.description && typeof v.description === 'string') {
+            var lines = v.description.split('\n');
+            var segs_desc = [];
+
+            for (var j = 0; j < lines.length; j++) {
+                var line = lines[j].trim();
+                if (!line) continue;
+
+                // Вариант 1: Время в начале строки: [00:54:38] 2 Серия или 00:54:38 - 2 Серия
+                var m = line.match(/^\[?(?:(\d{1,2}):)?([0-5]?\d):([0-5]\d)\]?\s*[-—–:.]?\s*(.+)$/);
+                if (m) {
+                    var t1 = parseTimecodeToSeconds(m[1] ? m[1] + ':' + m[2] + ':' + m[3] : m[2] + ':' + m[3]);
+                    segs_desc.push({
+                        text: m[4].trim(),
+                        time: t1
+                    });
+                    continue;
+                }
+
+                // Вариант 2: Время в конце строки: 2 Серия - 00:54:38 или 2 Серия (00:54:38)
+                m = line.match(/^(.+?)\s*[-—–:(]\s*\[?(?:(\d{1,2}):)?([0-5]?\d):([0-5]\d)\]?\)?$/);
+                if (m) {
+                    var t2 = parseTimecodeToSeconds(m[2] ? m[2] + ':' + m[3] + ':' + m[4] : m[3] + ':' + m[4]);
+                    segs_desc.push({
+                        text: m[1].trim(),
+                        time: t2
+                    });
+                }
+            }
+
+            if (segs_desc.length > 1) {
+                segs_desc.sort(function (a, b) { return a.time - b.time; });
+                for (var k = 0; k < segs_desc.length; k++) {
+                    var next_t = (k + 1 < segs_desc.length) ? segs_desc[k + 1].time : (v.duration || (segs_desc[k].time + 3600));
+                    segs_desc[k].duration = Math.max(0, next_t - segs_desc[k].time);
+                }
+                return segs_desc;
+            }
+        }
+
+        return null;
+    }
+
+    function qualityScore(q) {
+        if (!q) return 0;
+        if (q.indexOf('4K') !== -1 || q.indexOf('2160') !== -1) return 5;
+        if (q.indexOf('2K') !== -1 || q.indexOf('1440') !== -1) return 4;
+        if (q.indexOf('1080') !== -1) return 3;
+        if (q.indexOf('720') !== -1) return 2;
+        if (q.indexOf('480') !== -1) return 1;
+        return 0;
+    }
+
+    function seekToStartTime(target_sec) {
+        if (!target_sec || target_sec <= 0) return;
+
+        var sought = false;
+        var attempts = 0;
+        var max_attempts = 50;
+
+        function doSeek() {
+            if (sought) return;
+            var video = (Lampa.PlayerVideo && Lampa.PlayerVideo.video && Lampa.PlayerVideo.video()) ||
+                        document.querySelector('video.player-video__video, video');
+
+            if (video && video.duration && !isNaN(video.duration) && video.duration > 0) {
+                sought = true;
+                try {
+                    video.currentTime = target_sec;
+                } catch (e) {}
+                if (Lampa.PlayerVideo && Lampa.PlayerVideo.to) {
+                    try {
+                        Lampa.PlayerVideo.to(target_sec);
+                    } catch (e) {}
+                }
+                return;
+            }
+
+            attempts++;
+            if (attempts < max_attempts) {
+                setTimeout(doSeek, 200);
+            }
+        }
+
+        var interval = setInterval(function () {
+            var video = (Lampa.PlayerVideo && Lampa.PlayerVideo.video && Lampa.PlayerVideo.video()) ||
+                        document.querySelector('video.player-video__video, video');
+            if (video) {
+                clearInterval(interval);
+                var onMetadata = function () {
+                    video.removeEventListener('loadedmetadata', onMetadata);
+                    video.removeEventListener('canplay', onMetadata);
+                    setTimeout(doSeek, 100);
+                };
+                if (video.duration && !isNaN(video.duration) && video.duration > 0) {
+                    doSeek();
+                } else {
+                    video.addEventListener('loadedmetadata', onMetadata);
+                    video.addEventListener('canplay', onMetadata);
+                    setTimeout(doSeek, 300);
+                }
+            } else if (attempts >= max_attempts) {
+                clearInterval(interval);
+            }
+        }, 100);
+    }
+
     function parseEpisodeNum(title, season_target) {
         if (!title) return null;
 
@@ -495,12 +648,6 @@
                     if (NOISE_REG.test(v.title)) return;
                     if (v.duration < 300) return; // меньше 5 минут
 
-                    var ep_num = parseEpisodeNum(v.title, season_num);
-                    if (!ep_num) return;
-
-                    var voice = detectVoice(v.title) || detectVoice(v.description) || 'Оригинал / Залив';
-                    if (voice) detected_voices[voice] = true;
-
                     var q_info = extractQualities(v.files);
                     if (!q_info.default_url) return;
 
@@ -516,6 +663,54 @@
                         });
                     }
 
+                    var segments = extractSegmentsFromVideo(v);
+
+                    if (segments && segments.length > 1) {
+                        // Проверяем, не для другого ли сезона этот сборник
+                        var title_season = null;
+                        var sm = v.title.match(/(?:(\d+)\s*(?:сезон|season|s))/i);
+                        if (sm) title_season = parseInt(sm[1], 10);
+                        if (title_season && title_season !== season_num) return;
+
+                        var comp_voice = detectVoice(v.title) || detectVoice(v.description) || 'Оригинал / Залив';
+                        if (comp_voice) detected_voices[comp_voice] = true;
+
+                        segments.forEach(function (seg, seg_idx) {
+                            var ep_num = parseEpisodeNum(seg.text, season_num) || (seg_idx + 1);
+                            var seg_voice = detectVoice(seg.text) || comp_voice;
+                            if (seg_voice) detected_voices[seg_voice] = true;
+
+                            var seg_obj = {
+                                episode: ep_num,
+                                season: season_num,
+                                title: v.title,
+                                video_id: v.id,
+                                duration: seg.duration,
+                                voice: seg_voice,
+                                qualities: q_info.map,
+                                max_quality: q_info.max,
+                                default_url: q_info.default_url,
+                                subtitles: subs,
+                                hash: Lampa.Utils.hash('vk_seg_' + (movie.id || search_title) + '_s' + season_num + 'e' + ep_num + '_' + v.id),
+                                is_segmented: true,
+                                start_time: seg.time,
+                                segment_label: seg.text
+                            };
+
+                            if (!episodes_map[ep_num]) {
+                                episodes_map[ep_num] = [];
+                            }
+                            episodes_map[ep_num].push(seg_obj);
+                        });
+                        return;
+                    }
+
+                    var ep_num = parseEpisodeNum(v.title, season_num);
+                    if (!ep_num) return;
+
+                    var voice = detectVoice(v.title) || detectVoice(v.description) || 'Оригинал / Залив';
+                    if (voice) detected_voices[voice] = true;
+
                     var ep_obj = {
                         episode: ep_num,
                         season: season_num,
@@ -527,7 +722,10 @@
                         max_quality: q_info.max,
                         default_url: q_info.default_url,
                         subtitles: subs,
-                        hash: Lampa.Utils.hash('vk_' + (movie.id || search_title) + '_s' + season_num + 'e' + ep_num)
+                        hash: Lampa.Utils.hash('vk_' + (movie.id || search_title) + '_s' + season_num + 'e' + ep_num),
+                        is_segmented: false,
+                        start_time: 0,
+                        segment_label: ''
                     };
 
                     if (!episodes_map[ep_num]) {
@@ -537,6 +735,14 @@
                 }
 
                 videos.forEach(processVideo);
+
+                for (var ep_key in episodes_map) {
+                    episodes_map[ep_key].sort(function (a, b) {
+                        var qDiff = qualityScore(b.max_quality) - qualityScore(a.max_quality);
+                        if (qDiff !== 0) return qDiff;
+                        return (!a.is_segmented ? 1 : 0) - (!b.is_segmented ? 1 : 0);
+                    });
+                }
 
                 episodes_all = [];
                 for (var k in episodes_map) {
@@ -550,8 +756,38 @@
                 active_voice_filter = 'all';
 
                 if (episodes_all.length === 0) {
-                    // Точечный добор
-                    _this.loadTargetedEpisode(search_title, season_num, 1);
+                    // Пробуем дополнительный поиск сборника "все серии"
+                    var comp_query = search_title + ' ' + season_num + ' сезон все серии';
+                    searchVk(comp_query, function (comp_videos) {
+                        comp_videos.forEach(processVideo);
+
+                        for (var c_key in episodes_map) {
+                            episodes_map[c_key].sort(function (a, b) {
+                                var qDiff = qualityScore(b.max_quality) - qualityScore(a.max_quality);
+                                if (qDiff !== 0) return qDiff;
+                                return (!a.is_segmented ? 1 : 0) - (!b.is_segmented ? 1 : 0);
+                            });
+                        }
+
+                        episodes_all = [];
+                        for (var ck in episodes_map) {
+                            episodes_all.push(episodes_map[ck]);
+                        }
+                        episodes_all.sort(function (a, b) {
+                            return a[0].episode - b[0].episode;
+                        });
+
+                        voices_found = Object.keys(detected_voices);
+                        active_voice_filter = 'all';
+
+                        if (episodes_all.length > 0) {
+                            _this.renderEpisodesGrid();
+                        } else {
+                            _this.loadTargetedEpisode(search_title, season_num, 1);
+                        }
+                    }, function () {
+                        _this.loadTargetedEpisode(search_title, season_num, 1);
+                    });
                 } else {
                     _this.renderEpisodesGrid();
                 }
@@ -572,6 +808,32 @@
                         var q_info = extractQualities(v.files);
                         if (!q_info.default_url) return;
 
+                        var segments = extractSegmentsFromVideo(v);
+                        if (segments && segments.length > 1) {
+                            segments.forEach(function (seg, seg_idx) {
+                                var s_ep = parseEpisodeNum(seg.text, s) || (seg_idx + 1);
+                                if (s_ep === e) {
+                                    found.push([{
+                                        episode: e,
+                                        season: s,
+                                        title: v.title,
+                                        video_id: v.id,
+                                        duration: seg.duration,
+                                        voice: detectVoice(seg.text) || detectVoice(v.title) || 'По умолчанию',
+                                        qualities: q_info.map,
+                                        max_quality: q_info.max,
+                                        default_url: q_info.default_url,
+                                        subtitles: [],
+                                        hash: Lampa.Utils.hash('vk_seg_' + (movie.id || title) + '_s' + s + 'e' + e + '_' + v.id),
+                                        is_segmented: true,
+                                        start_time: seg.time,
+                                        segment_label: seg.text
+                                    }]);
+                                }
+                            });
+                            return;
+                        }
+
                         var ep_num = parseEpisodeNum(v.title, s) || e;
                         found.push([{
                             episode: ep_num,
@@ -584,7 +846,10 @@
                             max_quality: q_info.max,
                             default_url: q_info.default_url,
                             subtitles: [],
-                            hash: Lampa.Utils.hash('vk_' + (movie.id || title) + '_s' + s + 'e' + ep_num)
+                            hash: Lampa.Utils.hash('vk_' + (movie.id || title) + '_s' + s + 'e' + ep_num),
+                            is_segmented: false,
+                            start_time: 0,
+                            segment_label: ''
                         }]);
                     }
                 });
@@ -676,12 +941,26 @@
 
             display_episodes.forEach(function (ep, index) {
                 var ep_title = 'Серия ' + ep.episode;
-                var ep_info = (ep.voice ? '[' + ep.voice + '] ' : '') + formatTime(ep.duration);
+                var badges = '<span style="background: #0077FF; color: #fff; padding: 0.1em 0.4em; border-radius: 0.3em; margin-right: 0.4em; font-size: 0.85em;">' + ep.max_quality + '</span>';
+
+                if (ep.is_segmented) {
+                    badges += '<span style="background: #FF9800; color: #fff; padding: 0.1em 0.4em; border-radius: 0.3em; margin-right: 0.4em; font-size: 0.85em; font-weight: 600;">⏱️ Таймкод</span>';
+                }
+
+                var clean_seg_text = (ep.segment_label || '').replace(/^(?:серия|эпизод|ep|e)?\s*\d+\s*[-—:.]?\s*/i, '').trim();
+                var ep_sub = clean_seg_text ? ' (' + clean_seg_text + ')' : '';
+
+                var ep_info_parts = [];
+                if (ep.voice) ep_info_parts.push('[' + ep.voice + ']');
+                if (ep.duration) ep_info_parts.push(formatTime(ep.duration));
+                if (ep.is_segmented && ep.start_time > 0) {
+                    ep_info_parts.push('(старт с ' + formatTimecode(ep.start_time) + ')');
+                }
 
                 var item = Lampa.Template.get('vk_item', {
-                    title: ep_title + (ep.title ? ' — ' + ep.title : ''),
-                    quality: '<span style="background: #0077FF; color: #fff; padding: 0.1em 0.4em; border-radius: 0.3em; margin-right: 0.4em; font-size: 0.85em;">' + ep.max_quality + '</span>',
-                    info: ep_info
+                    title: ep_title + ep_sub + (ep.title ? ' — ' + ep.title : ''),
+                    quality: badges,
+                    info: ep_info_parts.join(' • ')
                 });
 
                 var timeline = Lampa.Timeline.view(ep.hash);
@@ -735,6 +1014,9 @@
                         });
                     }
 
+                    var segments = extractSegmentsFromVideo(v);
+                    var has_segments = segments && segments.length > 1;
+
                     filtered.push({
                         title: v.title,
                         video_id: v.id,
@@ -743,7 +1025,8 @@
                         max_quality: q_info.max,
                         default_url: q_info.default_url,
                         subtitles: subs,
-                        hash: Lampa.Utils.hash('vk_movie_' + (movie.id || search_title) + '_' + v.id)
+                        hash: Lampa.Utils.hash('vk_movie_' + (movie.id || search_title) + '_' + v.id),
+                        has_segments: has_segments
                     });
                 });
 
@@ -756,9 +1039,14 @@
                 _this.loading(false);
 
                 filtered.forEach(function (m_item) {
+                    var m_badges = '<span style="background: #0077FF; color: #fff; padding: 0.1em 0.4em; border-radius: 0.3em; margin-right: 0.4em; font-size: 0.85em;">' + m_item.max_quality + '</span>';
+                    if (m_item.has_segments) {
+                        m_badges += '<span style="background: #FF9800; color: #fff; padding: 0.1em 0.4em; border-radius: 0.3em; margin-right: 0.4em; font-size: 0.85em; font-weight: 600;">⏱️ Таймкоды</span>';
+                    }
+
                     var item = Lampa.Template.get('vk_item', {
                         title: m_item.title,
-                        quality: '<span style="background: #0077FF; color: #fff; padding: 0.1em 0.4em; border-radius: 0.3em; margin-right: 0.4em; font-size: 0.85em;">' + m_item.max_quality + '</span>',
+                        quality: m_badges,
                         info: formatTime(m_item.duration)
                     });
 
@@ -815,10 +1103,17 @@
                 quality: proxied_qualities,
                 timeline: {
                     hash: item.hash
-                }
+                },
+                start_time: item.start_time || 0
             };
 
             Lampa.Player.play(player_item);
+
+            if (item.start_time && item.start_time > 0) {
+                var tl = item.hash && Lampa.Timeline.view(item.hash);
+                var target_sec = (tl && tl.percent && tl.time) ? tl.time : item.start_time;
+                seekToStartTime(target_sec);
+            }
 
             if (playlist_items && playlist_items.length > 1) {
                 var playlist = playlist_items.map(function (elem) {
@@ -828,11 +1123,18 @@
                             elem_q[eq] = prepareStreamUrl(elem.qualities[eq]);
                         }
                     }
+                    var p_title = 'Серия ' + elem.episode + (elem.is_segmented ? ' [Таймкод]' : '');
+                    if (elem.segment_label && elem.segment_label !== 'Серия ' + elem.episode) {
+                        p_title += ' (' + elem.segment_label + ')';
+                    }
                     return {
-                        title: 'Серия ' + elem.episode + ' — ' + elem.title,
+                        title: p_title + (elem.title ? ' — ' + elem.title : ''),
                         url: prepareStreamUrl(elem.default_url),
                         quality: elem_q,
-                        timeline: { hash: elem.hash }
+                        timeline: { hash: elem.hash },
+                        start_time: elem.start_time || 0,
+                        episode: elem.episode,
+                        season: elem.season
                     };
                 });
 
@@ -977,6 +1279,17 @@
         Lampa.Listener.follow('player', function () {
             fixPlayerCrossOrigin();
         });
+
+        if (Lampa.Player && Lampa.Player.listener && Lampa.Player.listener.follow) {
+            Lampa.Player.listener.follow('start', function (data) {
+                fixPlayerCrossOrigin();
+                if (data && data.start_time && data.start_time > 0) {
+                    var tl = data.timeline && data.timeline.hash && Lampa.Timeline.view(data.timeline.hash);
+                    var target_sec = (tl && tl.percent && tl.time) ? tl.time : data.start_time;
+                    seekToStartTime(target_sec);
+                }
+            });
+        }
 
         Lampa.Component.add('vk_view', VkComponent);
 
