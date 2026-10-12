@@ -636,9 +636,26 @@
             scroll.clear();
 
             var search_title = cleanTitle(movie.name || movie.title);
-            var query = search_title + ' ' + season_num + ' сезон';
+            var queries = [
+                search_title + ' ' + season_num + ' сезон',
+                season_num === 1 ? (search_title + ' все серии') : (search_title + ' ' + season_num + ' сезон все серии')
+            ];
+            if (season_num === 1) {
+                queries.push(search_title + ' 1 сезон все серии');
+            }
 
-            searchVk(query, function (videos) {
+            var pending = queries.length;
+            var combined_videos = [];
+            var seen_video_ids = {};
+            var any_success = false;
+            var last_err = null;
+
+            function onQueriesFinished() {
+                if (!any_success && combined_videos.length === 0) {
+                    _this.empty('Не удалось загрузить видео из VK' + (last_err ? ' (' + last_err.message + ')' : ''));
+                    return;
+                }
+
                 var episodes_map = {};
                 var detected_voices = {};
 
@@ -734,7 +751,7 @@
                     episodes_map[ep_num].push(ep_obj);
                 }
 
-                videos.forEach(processVideo);
+                combined_videos.forEach(processVideo);
 
                 for (var ep_key in episodes_map) {
                     episodes_map[ep_key].sort(function (a, b) {
@@ -756,43 +773,31 @@
                 active_voice_filter = 'all';
 
                 if (episodes_all.length === 0) {
-                    // Пробуем дополнительный поиск сборника "все серии"
-                    var comp_query = search_title + ' ' + season_num + ' сезон все серии';
-                    searchVk(comp_query, function (comp_videos) {
-                        comp_videos.forEach(processVideo);
-
-                        for (var c_key in episodes_map) {
-                            episodes_map[c_key].sort(function (a, b) {
-                                var qDiff = qualityScore(b.max_quality) - qualityScore(a.max_quality);
-                                if (qDiff !== 0) return qDiff;
-                                return (!a.is_segmented ? 1 : 0) - (!b.is_segmented ? 1 : 0);
-                            });
-                        }
-
-                        episodes_all = [];
-                        for (var ck in episodes_map) {
-                            episodes_all.push(episodes_map[ck]);
-                        }
-                        episodes_all.sort(function (a, b) {
-                            return a[0].episode - b[0].episode;
-                        });
-
-                        voices_found = Object.keys(detected_voices);
-                        active_voice_filter = 'all';
-
-                        if (episodes_all.length > 0) {
-                            _this.renderEpisodesGrid();
-                        } else {
-                            _this.loadTargetedEpisode(search_title, season_num, 1);
-                        }
-                    }, function () {
-                        _this.loadTargetedEpisode(search_title, season_num, 1);
-                    });
+                    _this.loadTargetedEpisode(search_title, season_num, 1);
                 } else {
                     _this.renderEpisodesGrid();
                 }
-            }, function (err) {
-                _this.empty('Не удалось загрузить видео из VK (' + err.message + ')');
+            }
+
+            queries.forEach(function (q) {
+                searchVk(q, function (videos) {
+                    any_success = true;
+                    if (Array.isArray(videos)) {
+                        videos.forEach(function (item) {
+                            var vid = item && item.video;
+                            if (vid && vid.id && !seen_video_ids[vid.id]) {
+                                seen_video_ids[vid.id] = true;
+                                combined_videos.push(item);
+                            }
+                        });
+                    }
+                    pending--;
+                    if (pending === 0) onQueriesFinished();
+                }, function (err) {
+                    last_err = err;
+                    pending--;
+                    if (pending === 0) onQueriesFinished();
+                });
             });
         };
 

@@ -529,11 +529,26 @@
             scroll.clear();
 
             var search_title = cleanTitle(movie.name || movie.title);
-            var query = encodeURIComponent(search_title + ' ' + season_num + ' сезон');
-            var url = 'https://rutube.ru/api/search/video/?query=' + query;
+            var queries = [
+                search_title + ' ' + season_num + ' сезон',
+                season_num === 1 ? (search_title + ' все серии') : (search_title + ' ' + season_num + ' сезон все серии')
+            ];
+            if (season_num === 1) {
+                queries.push(search_title + ' 1 сезон все серии');
+            }
 
-            apiRequest(url, {}, function (data) {
-                var results = (data && data.results) || [];
+            var pending = queries.length;
+            var combined_videos = [];
+            var seen_video_ids = {};
+            var any_success = false;
+            var last_err = null;
+
+            function onQueriesFinished() {
+                if (!any_success && combined_videos.length === 0) {
+                    _this.empty('Не удалось загрузить серии с Rutube' + (last_err ? ' (' + last_err.message + ')' : ''));
+                    return;
+                }
+
                 var episodes_map = {};
                 var detected_voices = {};
 
@@ -605,7 +620,7 @@
                     episodes_map[ep_num].push(ep_obj);
                 }
 
-                results.forEach(processVideo);
+                combined_videos.forEach(processVideo);
 
                 episodes_all = [];
                 for (var k in episodes_map) {
@@ -619,37 +634,30 @@
                 active_voice_filter = 'all';
 
                 if (episodes_all.length === 0) {
-                    // Пробуем поиск сборников "все серии"
-                    var comp_query = encodeURIComponent(search_title + ' ' + season_num + ' сезон все серии');
-                    var comp_url = 'https://rutube.ru/api/search/video/?query=' + comp_query;
-                    apiRequest(comp_url, {}, function (cdata) {
-                        var cresults = (cdata && cdata.results) || [];
-                        cresults.forEach(processVideo);
-
-                        episodes_all = [];
-                        for (var ck in episodes_map) {
-                            episodes_all.push(episodes_map[ck]);
-                        }
-                        episodes_all.sort(function (a, b) {
-                            return a[0].episode - b[0].episode;
-                        });
-
-                        voices_found = Object.keys(detected_voices);
-                        active_voice_filter = 'all';
-
-                        if (episodes_all.length > 0) {
-                            _this.renderEpisodesGrid();
-                        } else {
-                            _this.loadTargetedEpisode(search_title, season_num, 1);
-                        }
-                    }, function () {
-                        _this.loadTargetedEpisode(search_title, season_num, 1);
-                    });
+                    _this.loadTargetedEpisode(search_title, season_num, 1);
                 } else {
                     _this.renderEpisodesGrid();
                 }
-            }, function (err) {
-                _this.empty('Не удалось загрузить серии с Rutube (' + err.message + ')');
+            }
+
+            queries.forEach(function (q) {
+                var url = 'https://rutube.ru/api/search/video/?query=' + encodeURIComponent(q);
+                apiRequest(url, {}, function (data) {
+                    any_success = true;
+                    var results = (data && data.results) || [];
+                    results.forEach(function (v) {
+                        if (v && v.id && !seen_video_ids[v.id]) {
+                            seen_video_ids[v.id] = true;
+                            combined_videos.push(v);
+                        }
+                    });
+                    pending--;
+                    if (pending === 0) onQueriesFinished();
+                }, function (err) {
+                    last_err = err;
+                    pending--;
+                    if (pending === 0) onQueriesFinished();
+                });
             });
         };
 
