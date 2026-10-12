@@ -738,11 +738,12 @@
         // Воспроизведение через Lampa.Player
         // ------------------------------------------
         this.playVideo = function (item, playlist_items, start_index) {
+            fixPlayerCrossOrigin();
+
             var player_item = {
                 title: item.title,
                 url: item.default_url,
                 quality: item.qualities,
-                subtitles: item.subtitles,
                 timeline: {
                     hash: item.hash
                 }
@@ -756,7 +757,6 @@
                         title: 'Серия ' + elem.episode + ' — ' + elem.title,
                         url: elem.default_url,
                         quality: elem.qualities,
-                        subtitles: elem.subtitles,
                         timeline: { hash: elem.hash }
                     };
                 });
@@ -814,10 +814,52 @@
     }
 
     // ==========================================
+    // Устранение CORS-блокировки видеоплеера
+    // ==========================================
+    function fixPlayerCrossOrigin() {
+        function clean(el) {
+            if (el && el.removeAttribute) {
+                el.removeAttribute('crossorigin');
+            }
+        }
+
+        $('video.player-video__video, video').each(function () {
+            clean(this);
+        });
+
+        if (window.Lampa && Lampa.PlayerVideo && typeof Lampa.PlayerVideo.video === 'function') {
+            clean(Lampa.PlayerVideo.video());
+        }
+
+        var v = (window.Lampa && Lampa.PlayerVideo && typeof Lampa.PlayerVideo.video === 'function')
+            ? Lampa.PlayerVideo.video()
+            : document.querySelector('video.player-video__video');
+        if (v && window.MutationObserver && !v.__ruvk_obs) {
+            try {
+                v.__ruvk_obs = true;
+                var obs = new MutationObserver(function (mutations) {
+                    mutations.forEach(function (m) {
+                        if (m.attributeName === 'crossorigin') {
+                            clean(v);
+                        }
+                    });
+                });
+                obs.observe(v, { attributes: true, attributeFilter: ['crossorigin'] });
+            } catch (e) {}
+        }
+    }
+
+    // ==========================================
     // Регистрация плагина и кнопки в карточке Lampa
     // ==========================================
     function startPlugin() {
         initTemplates();
+        fixPlayerCrossOrigin();
+
+        Lampa.Listener.follow('player', function () {
+            fixPlayerCrossOrigin();
+        });
+
         Lampa.Component.add('vk_view', VkComponent);
 
         Lampa.Listener.follow('full', function (e) {

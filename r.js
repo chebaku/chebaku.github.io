@@ -620,9 +620,16 @@
                     return;
                 }
 
+                var final_url = stream_url;
+                if (!Lampa.Platform.is('android')) {
+                    final_url = getProxy() + stream_url;
+                }
+
+                fixPlayerCrossOrigin();
+
                 var player_item = {
                     title: item.title,
-                    url: stream_url,
+                    url: final_url,
                     timeline: {
                         hash: item.hash
                     }
@@ -639,9 +646,13 @@
                                 var next_url = 'https://rutube.ru/api/play/options/' + elem.video_id + '/?no_404=true&referer=&pver=v2&client=wdp';
                                 apiRequest(next_url, {}, function (res) {
                                     var next_m3u8 = res && res.video_balancer && res.video_balancer.m3u8;
+                                    var next_final = next_m3u8;
+                                    if (next_m3u8 && !Lampa.Platform.is('android')) {
+                                        next_final = getProxy() + next_m3u8;
+                                    }
                                     call({
                                         title: 'Серия ' + elem.episode,
-                                        url: next_m3u8 || '',
+                                        url: next_final || '',
                                         timeline: { hash: elem.hash }
                                     });
                                 }, function () {
@@ -708,10 +719,52 @@
     }
 
     // ==========================================
+    // Устранение CORS-блокировки видеоплеера
+    // ==========================================
+    function fixPlayerCrossOrigin() {
+        function clean(el) {
+            if (el && el.removeAttribute) {
+                el.removeAttribute('crossorigin');
+            }
+        }
+
+        $('video.player-video__video, video').each(function () {
+            clean(this);
+        });
+
+        if (window.Lampa && Lampa.PlayerVideo && typeof Lampa.PlayerVideo.video === 'function') {
+            clean(Lampa.PlayerVideo.video());
+        }
+
+        var v = (window.Lampa && Lampa.PlayerVideo && typeof Lampa.PlayerVideo.video === 'function')
+            ? Lampa.PlayerVideo.video()
+            : document.querySelector('video.player-video__video');
+        if (v && window.MutationObserver && !v.__ruvk_obs) {
+            try {
+                v.__ruvk_obs = true;
+                var obs = new MutationObserver(function (mutations) {
+                    mutations.forEach(function (m) {
+                        if (m.attributeName === 'crossorigin') {
+                            clean(v);
+                        }
+                    });
+                });
+                obs.observe(v, { attributes: true, attributeFilter: ['crossorigin'] });
+            } catch (e) {}
+        }
+    }
+
+    // ==========================================
     // Регистрация плагина и кнопки в карточке Lampa
     // ==========================================
     function startPlugin() {
         initTemplates();
+        fixPlayerCrossOrigin();
+
+        Lampa.Listener.follow('player', function () {
+            fixPlayerCrossOrigin();
+        });
+
         // Регистрация компонента
         Lampa.Component.add('rutube_view', RutubeComponent);
 
