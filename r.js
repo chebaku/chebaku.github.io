@@ -10,7 +10,8 @@
     var PROXIES = [
         'https://proxy5.rte.net.ru/',
         'https://proxy7.rte.net.ru/',
-        'https://proxy4.rte.net.ru/'
+        'https://proxy4.rte.net.ru/',
+        'https://proxy6.rte.net.ru/'
     ];
     var current_proxy_index = 0;
 
@@ -21,6 +22,83 @@
     function rotateProxy() {
         current_proxy_index = (current_proxy_index + 1) % PROXIES.length;
     }
+
+    // ==========================================
+    // Глобальный перехват запросов к Rutube CDN
+    // Проксирование variant m3u8 и сегментов .ts/.mp4 для Hls.js
+    // ==========================================
+    (function hookNetworkForRutube() {
+        if (window.__rutube_net_hooked) return;
+        window.__rutube_net_hooked = true;
+
+        function shouldProxy(url) {
+            if (typeof url !== 'string') return false;
+            var is_rutube = (
+                url.indexOf('rtbcdn.ru') !== -1 ||
+                url.indexOf('rutube.ru') !== -1 ||
+                url.indexOf('bl.rutube.ru') !== -1
+            );
+            var is_already_proxied = (
+                url.indexOf('rte.net.ru') !== -1 ||
+                url.indexOf('/http') !== -1
+            );
+            return is_rutube && !is_already_proxied;
+        }
+
+        var origXhrOpen = XMLHttpRequest.prototype.open;
+        XMLHttpRequest.prototype.open = function (method, url, async, user, password) {
+            if (shouldProxy(url)) {
+                url = getProxy() + url;
+            }
+            return origXhrOpen.call(this, method, url, async !== false, user, password);
+        };
+
+        if (window.fetch) {
+            var origFetch = window.fetch;
+            window.fetch = function (input, init) {
+                if (typeof input === 'string') {
+                    if (shouldProxy(input)) {
+                        input = getProxy() + input;
+                    }
+                } else if (input && input.url && typeof input.url === 'string') {
+                    if (shouldProxy(input.url)) {
+                        try {
+                            input = new Request(getProxy() + input.url, input);
+                        } catch (e) {}
+                    }
+                }
+                return origFetch.apply(this, arguments);
+            };
+        }
+
+        function hookHls() {
+            if (window.Hls && Hls.DefaultConfig && !Hls.__rutube_loader_hooked) {
+                Hls.__rutube_loader_hooked = true;
+                var OrigLoader = Hls.DefaultConfig.loader;
+                if (OrigLoader) {
+                    function CustomHlsLoader(config) {
+                        var loader = new OrigLoader(config);
+                        var orig_load = loader.load.bind(loader);
+                        loader.load = function (context, cfg, callbacks) {
+                            if (context && context.url && shouldProxy(context.url)) {
+                                context.url = getProxy() + context.url;
+                            }
+                            return orig_load(context, cfg, callbacks);
+                        };
+                        return loader;
+                    }
+                    CustomHlsLoader.prototype = OrigLoader.prototype;
+                    Hls.DefaultConfig.loader = CustomHlsLoader;
+                }
+            }
+        }
+        hookHls();
+        if (window.Lampa && Lampa.Listener) {
+            Lampa.Listener.follow('app', function (e) {
+                if (e.type === 'ready') hookHls();
+            });
+        }
+    })();
 
     // ==========================================
     // Сетевой клиент (обход CORS на Tizen/webOS)
@@ -310,7 +388,7 @@
                         scroll.update($(e.target), true);
                     });
 
-                    item.on('hover:enter click', function () {
+                    item.on('hover:enter', function () {
                         current_season = season_num;
                         _this.loadSeasonEpisodes(season_num);
                     });
@@ -444,7 +522,7 @@
                     last_focused = e.target;
                     scroll.update($(e.target), true);
                 });
-                back_btn.on('hover:enter click', function () {
+                back_btn.on('hover:enter', function () {
                     _this.renderSeasonsList();
                 });
                 scroll.append(back_btn);
@@ -467,7 +545,7 @@
                     scroll.update($(e.target), true);
                 });
 
-                voice_btn.on('hover:enter click', function () {
+                voice_btn.on('hover:enter', function () {
                     var items = [{ title: 'Все / По умолчанию', voice: 'all', selected: active_voice_filter === 'all' }];
                     voices_found.forEach(function (v) {
                         items.push({ title: v, voice: v, selected: active_voice_filter === v });
@@ -526,7 +604,7 @@
                     scroll.update($(e.target), true);
                 });
 
-                item.on('hover:enter click', function () {
+                item.on('hover:enter', function () {
                     _this.playVideo(ep, display_episodes, index);
                 });
 
@@ -590,7 +668,7 @@
                         scroll.update($(e.target), true);
                     });
 
-                    item.on('hover:enter click', function () {
+                    item.on('hover:enter', function () {
                         _this.playVideo(m_item, null, 0);
                     });
 
@@ -606,7 +684,12 @@
         // ------------------------------------------
         // Воспроизведение через Lampa.Player
         // ------------------------------------------
+        var is_playing = false;
         this.playVideo = function (item, playlist_items, start_index) {
+            if (is_playing) return;
+            is_playing = true;
+            setTimeout(function () { is_playing = false; }, 1500);
+
             _this.loading(true);
 
             var play_url = 'https://rutube.ru/api/play/options/' + item.video_id + '/?no_404=true&referer=&pver=v2&client=wdp';
@@ -722,36 +805,79 @@
     // Устранение CORS-блокировки видеоплеера
     // ==========================================
     function fixPlayerCrossOrigin() {
-        function clean(el) {
-            if (el && el.removeAttribute) {
-                el.removeAttribute('crossorigin');
+        if (!window.__ruvk_crossorigin_hooked) {
+            window.__ruvk_crossorigin_hooked = true;
+
+            var orig_setAttribute = Element.prototype.setAttribute;
+            Element.prototype.setAttribute = function (name, value) {
+                if (name && typeof name === 'string' && name.toLowerCase() === 'crossorigin') {
+                    if (this.tagName === 'VIDEO' || this.tagName === 'AUDIO') {
+                        return;
+                    }
+                }
+                return orig_setAttribute.apply(this, arguments);
+            };
+
+            try {
+                if (window.HTMLMediaElement && HTMLMediaElement.prototype) {
+                    Object.defineProperty(HTMLMediaElement.prototype, 'crossOrigin', {
+                        get: function () { return null; },
+                        set: function () { this.removeAttribute('crossorigin'); },
+                        configurable: true
+                    });
+
+                    var desc = Object.getOwnPropertyDescriptor(HTMLMediaElement.prototype, 'src');
+                    if (desc && desc.set) {
+                        var orig_src_set = desc.set;
+                        Object.defineProperty(HTMLMediaElement.prototype, 'src', {
+                            get: desc.get,
+                            set: function (val) {
+                                this.removeAttribute('crossorigin');
+                                this.crossOrigin = null;
+                                orig_src_set.call(this, val);
+                            },
+                            configurable: true
+                        });
+                    }
+
+                    var orig_load = HTMLMediaElement.prototype.load;
+                    if (orig_load) {
+                        HTMLMediaElement.prototype.load = function () {
+                            this.removeAttribute('crossorigin');
+                            this.crossOrigin = null;
+                            return orig_load.apply(this, arguments);
+                        };
+                    }
+
+                    var orig_play = HTMLMediaElement.prototype.play;
+                    if (orig_play) {
+                        HTMLMediaElement.prototype.play = function () {
+                            this.removeAttribute('crossorigin');
+                            this.crossOrigin = null;
+                            return orig_play.apply(this, arguments);
+                        };
+                    }
+                }
+            } catch (e) {}
+
+            if (window.Lampa && Lampa.PlayerVideo && Lampa.PlayerVideo.url) {
+                var orig_pv_url = Lampa.PlayerVideo.url;
+                Lampa.PlayerVideo.url = function (src, change_quality) {
+                    var res = orig_pv_url.apply(this, arguments);
+                    var v = (Lampa.PlayerVideo.video && Lampa.PlayerVideo.video()) || document.querySelector('video.player-video__video');
+                    if (v) {
+                        v.removeAttribute('crossorigin');
+                        v.crossOrigin = null;
+                    }
+                    return res;
+                };
             }
         }
 
         $('video.player-video__video, video').each(function () {
-            clean(this);
+            this.removeAttribute('crossorigin');
+            this.crossOrigin = null;
         });
-
-        if (window.Lampa && Lampa.PlayerVideo && typeof Lampa.PlayerVideo.video === 'function') {
-            clean(Lampa.PlayerVideo.video());
-        }
-
-        var v = (window.Lampa && Lampa.PlayerVideo && typeof Lampa.PlayerVideo.video === 'function')
-            ? Lampa.PlayerVideo.video()
-            : document.querySelector('video.player-video__video');
-        if (v && window.MutationObserver && !v.__ruvk_obs) {
-            try {
-                v.__ruvk_obs = true;
-                var obs = new MutationObserver(function (mutations) {
-                    mutations.forEach(function (m) {
-                        if (m.attributeName === 'crossorigin') {
-                            clean(v);
-                        }
-                    });
-                });
-                obs.observe(v, { attributes: true, attributeFilter: ['crossorigin'] });
-            } catch (e) {}
-        }
     }
 
     // ==========================================
