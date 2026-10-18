@@ -80,6 +80,169 @@
     return { hash: hash, magnet: magnet };
   }
 
+  var currentPlayingStudios = [];
+
+  function parseVoiceStudios(raw) {
+    if (!raw || typeof raw !== 'string') return [];
+    var s = raw.trim();
+
+    var m = s.match(/\(([^)]+)\)/g);
+    if (m) {
+      for (var i = 0; i < m.length; i++) {
+        var cand = m[i].replace(/[()]/g, '').trim();
+        if (cand.indexOf(',') !== -1 || /[а-яёА-ЯЁ]/i.test(cand)) {
+          s = cand;
+          break;
+        }
+      }
+    }
+
+    var parts = s.split(/[,/+|•]+/);
+    var techPatterns = [
+      /^\d+p$/i,
+      /^(?:4k|uhd|fhd|hd|sd)$/i,
+      /^\d+([.,]\d+)?\s*(?:gb|гб|mb|мб|tb|тб)$/i,
+      /^(?:sdr|hdr\d*\+?|dolby\s*vision|dv|dovi)$/i,
+      /^(?:h\.?265|hevc|h\.?264|avc|x264|x265|vp9|av1|10bit|8bit)$/i,
+      /^(?:bdrip|web-?dl|web-?rip|remux|hdtv|camrip|ts|dvdrip)$/i,
+      /^(?:ac3|eac3|dts(?:-hd)?|truehd|atmos|aac|flac|mp3)$/i,
+      /^(?:5\.1|7\.1|2\.0|1\.0|\d+\s*ch)$/i,
+      /^\d+$/
+    ];
+
+    var studios = [];
+    var seen = {};
+
+    for (var j = 0; j < parts.length; j++) {
+      var clean = parts[j].trim();
+      if (clean.length < 2) continue;
+
+      var low = clean.toLowerCase();
+      if (low === 'неизвестно' || low === 'unknown' || low === 'по умолчанию') continue;
+      if (/\.(mkv|mp4|avi|ts|m2ts)$/i.test(clean)) continue;
+      if (/s\d+\s*e\d+/i.test(clean)) continue;
+      if (/^\d+\s*(серия|сезон|эпизод|выпуск)/i.test(clean)) continue;
+
+      var isTech = false;
+      for (var k = 0; k < techPatterns.length; k++) {
+        if (techPatterns[k].test(clean)) {
+          isTech = true;
+          break;
+        }
+      }
+
+      if (!isTech && !seen[low]) {
+        seen[low] = true;
+        studios.push(clean);
+      }
+    }
+
+    return studios;
+  }
+
+  function extractMediaStudios(file, choice) {
+    var sources = [];
+    if (file) {
+      if (file.translate) sources.push(file.translate);
+      if (file.voice_name) sources.push(file.voice_name);
+      if (file.title) sources.push(file.title);
+      if (file.text) sources.push(file.text);
+    }
+    if (choice && choice.voice_name) {
+      sources.push(choice.voice_name);
+    }
+
+    for (var i = 0; i < sources.length; i++) {
+      var list = parseVoiceStudios(sources[i]);
+      if (list && list.length) return list;
+    }
+    return [];
+  }
+
+  function buildLampaTranslates(studios) {
+    if (!studios || !studios.length) return {};
+    var tracks = studios.map(function (s) {
+      return {
+        language: s,
+        name: s
+      };
+    });
+    return { tracks: tracks };
+  }
+
+  function enhanceAudioTrackItems(items, studios) {
+    if (!items || !items.length) return;
+    var stdList = studios && studios.length ? studios.slice() : [];
+    var rusIndex = 0;
+
+    items.forEach(function (track, idx) {
+      var lang = (track.language || '').toLowerCase().trim();
+      var extra = track.extra || {};
+      var isRussian = lang === 'rus' || lang === 'ru' || lang === 'russian';
+      var isEnglish = lang === 'eng' || lang === 'en' || lang === 'english';
+      var isUkrainian = lang === 'ukr' || lang === 'uk' || lang === 'ukrainian';
+      var isUnknown = !lang || lang === 'und' || lang === 'unk' || lang === 'unknown';
+
+      var studio = '';
+      if (isRussian || (isUnknown && rusIndex < stdList.length)) {
+        if (rusIndex < stdList.length) {
+          studio = stdList[rusIndex];
+          rusIndex++;
+        } else if (stdList.length === 1) {
+          studio = stdList[0];
+        } else {
+          studio = 'Русский';
+        }
+      } else if (isEnglish || (isUnknown && idx === items.length - 1 && items.length > 1)) {
+        studio = 'Оригинал';
+      } else if (isUkrainian) {
+        studio = 'Украинский';
+      } else if (lang && !isUnknown) {
+        studio = lang.toUpperCase();
+      }
+
+      var parts = [];
+      parts.push(idx + 1);
+
+      if (studio) {
+        parts.push(studio);
+      } else {
+        parts.push('Дорожка ' + (idx + 1));
+      }
+
+      var showLang = lang && lang !== 'und' && lang !== 'unk';
+      if (showLang && (!studio || studio.toLowerCase() !== lang)) {
+        parts.push(lang);
+      }
+
+      if (extra.channels) {
+        var ch = parseInt(extra.channels);
+        if (ch === 6) parts.push('5.1');
+        else if (ch === 2) parts.push('2.0');
+        else if (ch === 8) parts.push('7.1');
+        else if (ch === 1) parts.push('1.0');
+        else if (ch > 0) parts.push(ch + ' Ch');
+      }
+
+      var fourCC = extra.fourCC || extra.four_cc || '';
+      if (fourCC) {
+        var codec = fourCC;
+        if (/ac-?3/i.test(codec) && !/eac-?3|ec-?3/i.test(codec)) codec = 'AC3';
+        else if (/eac-?3|ec-?3/i.test(codec)) codec = 'E-AC3';
+        else if (/dts-?hd/i.test(codec)) codec = 'DTS-HD';
+        else if (/dts/i.test(codec)) codec = 'DTS';
+        else if (/truehd/i.test(codec)) codec = 'TrueHD';
+        else if (/mp4a|aac/i.test(codec)) codec = 'AAC';
+        else if (/flac/i.test(codec)) codec = 'FLAC';
+        else if (/opus/i.test(codec)) codec = 'Opus';
+        else if (/vorbis/i.test(codec)) codec = 'Vorbis';
+        parts.push(codec);
+      }
+
+      track.title = parts.join(' / ');
+    });
+  }
+
   var Network = Lampa.Reguest;
 
   function component(object) {
@@ -356,7 +519,9 @@
         season: file.season,
         episode: file.episode,
         voice_name: file.voice_name,
-        thumbnail: file.thumbnail
+        thumbnail: file.thumbnail,
+        voice_studios: file.voice_studios,
+        translate: file.translate
       };
       return play;
     };
@@ -389,9 +554,13 @@
             item,
             function (json, json_call) {
               if (json && json.url) {
+                var studios = extractMediaStudios(item, _this5.getChoice());
+                var translObj = buildLampaTranslates(studios);
                 var playlist = [];
                 var first = _this5.toPlayElement(item);
                 first.url = json.url;
+                first.voice_studios = studios;
+                first.translate = translObj;
                 first.headers = json_call.headers || json.headers;
                 first.quality = json_call.quality || item.qualitys;
                 first.segments = json_call.segments || item.segments;
@@ -403,6 +572,8 @@
                   videos.forEach(function (elem) {
                     var cell = _this5.toPlayElement(elem);
                     cell.url = elem.url;
+                    cell.voice_studios = studios;
+                    cell.translate = translObj;
                     _this5.orUrlReserve(cell);
                     _this5.setDefaultQuality(cell);
                     playlist.push(cell);
@@ -415,6 +586,7 @@
                 if (first.url) {
                   var element = first;
                   element.isonline = true;
+                  currentPlayingStudios = studios;
                   Lampa.Player.play(element);
                   Lampa.Player.playlist(playlist);
                   item.mark();
@@ -1028,10 +1200,14 @@
               if (a.torrserver && linkInfo.hash) {
                 var tsUrl = (Lampa.Storage.get('torrserver_url') || Lampa.Storage.get('torrserver_url_two') || '').replace(/\/$/, '');
                 var sUrl = tsUrl + '/stream?link=' + linkInfo.hash + '&index=1&play';
+                var studios = extractMediaStudios(params.element);
+                currentPlayingStudios = studios;
                 Lampa.Player.play({
                   title: params.element.title,
                   url: sUrl,
-                  isonline: true
+                  isonline: true,
+                  voice_studios: studios,
+                  translate: buildLampaTranslates(studios)
                 });
               }
               if (a.copymagnet && linkInfo.magnet) {
@@ -1363,6 +1539,40 @@
         });
       }
     } catch (e) {}
+
+    if (!window.tr_audio_tracks_hooked && Lampa.Select && Lampa.Select.show) {
+      window.tr_audio_tracks_hooked = true;
+      var originSelectShow = Lampa.Select.show;
+      Lampa.Select.show = function (params) {
+        try {
+          if (
+            params &&
+            params.title === Lampa.Lang.translate('player_tracks') &&
+            Array.isArray(params.items) &&
+            params.items.length
+          ) {
+            enhanceAudioTrackItems(params.items, currentPlayingStudios);
+          }
+        } catch (e) {
+          console.log('TR', 'audio tracks hook error:', e.message);
+        }
+        return originSelectShow.call(this, params);
+      };
+    }
+
+    if (Lampa.Player && Lampa.Player.listener) {
+      Lampa.Player.listener.follow('start', function (data) {
+        if (data && data.voice_studios && data.voice_studios.length) {
+          currentPlayingStudios = data.voice_studios;
+        } else if (data) {
+          currentPlayingStudios = extractMediaStudios(data);
+        }
+      });
+
+      Lampa.Player.listener.follow('destroy', function () {
+        currentPlayingStudios = [];
+      });
+    }
   }
 
   if (window.appready) {
