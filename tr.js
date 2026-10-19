@@ -62,8 +62,21 @@
 
   function extractTorrentLinkInfo(url) {
     if (!url) return { hash: '', magnet: '' };
-    var m = url.match(/pidtor\/(?:serial\/)?s?([a-fA-F0-9]{40})/);
-    var hash = m ? m[1].toLowerCase() : '';
+    var hash = '';
+    var m = url.match(/pidtor\/(?:serial\/)?s?([a-fA-F0-9]{40})/i);
+    if (m) hash = m[1].toLowerCase();
+    if (!hash) {
+      var m2 = url.match(/[?&]link=([a-fA-F0-9]{40})/i);
+      if (m2) hash = m2[1].toLowerCase();
+    }
+    if (!hash) {
+      var m3 = url.match(/urn:btih:([a-fA-F0-9]{40})/i);
+      if (m3) hash = m3[1].toLowerCase();
+    }
+    if (!hash) {
+      var m4 = url.match(/\b([a-fA-F0-9]{40})\b/);
+      if (m4) hash = m4[1].toLowerCase();
+    }
     var trackers = [];
     var trRegex = /tr=([^&]+)/g;
     var trMatch;
@@ -81,6 +94,65 @@
   }
 
   var currentPlayingStudios = [];
+  var torrentReleasesMap = {};
+  var activeReleaseVoice = '';
+
+  var KNOWN_STUDIOS = [
+    'LostFilm', 'HDRezka', 'Rezka', 'Кубик в Кубе', 'Кубик', 'Дубляж', 'Пифагор',
+    'Jaskier', 'NewStudio', 'BaibaKo', 'AlexFilm', 'Кураж-Бамбей', 'Кураж',
+    'Red Head Sound', 'RHS', 'TVShows', 'ColdFilm', 'Flarrow Films', 'Kerob',
+    'Octopus', 'Гоблин', 'Сербин', 'Ю. Сербин', 'Гаврилов', 'Пучков', 'Невафильм',
+    'Мосфильм', 'Кириллица', 'Кравец', 'Good People', 'AniLibria', 'AniDUB',
+    'SHIZA Project', 'СВ-Дубль', 'SDI Media', 'Amedia', 'Novamedia', 'VSI',
+    'Postmodern', 'Hamster Studio', 'Hamster', 'Pazl Voice', 'Есарев', 'Яроцкий',
+    'Foxlight', 'Inter', 'Line', 'Субтитры', 'Украинский', 'Original', 'Оригинал'
+  ];
+
+  var VOICE_KEYWORDS = [
+    /дубляж/i, /дублирован/i, /многоголос/i, /двухголос/i, /одноголос/i, /закадр/i,
+    /авторск/i, /профессиональн/i, /любительск/i, /озвучк/i, /перевод/i, /\bmvo\b/i, /\bdvo\b/i, /\bavo\b/i
+  ];
+
+  function isGarbageStudio(s) {
+    if (!s || s.length < 2) return true;
+    var low = s.toLowerCase().trim();
+    if (low === 'неизвестно' || low === 'unknown' || low === 'по умолчанию' || low === 'default' || low === 'трек' || low === 'дорожка' || low === 'звук' || low === 'аудио') {
+      return true;
+    }
+    if (/^(?:эпизод|эпизода|эпизоды|серия|серии|серий|сезон|сезона|сезоны|выпуск|выпуски|часть|части)\s*[-:#№]?\s*\d+/i.test(low)) return true;
+    if (/^\d+\s*[-:#№]?\s*(?:эпизод|эпизода|эпизоды|серия|серии|серий|сезон|сезона|сезоны|выпуск|выпуски|часть|части)/i.test(low)) return true;
+    if (/^(?:episode|ep|season|part)\s*[-:#№]?\s*\d+/i.test(low)) return true;
+    if (/^\d+\s*[-:#№]?\s*(?:episode|ep|season|part)/i.test(low)) return true;
+    if (/^s\d+\s*e\d+/i.test(low)) return true;
+    if (/^(?:s\d+|e\d+)$/i.test(low)) return true;
+    if (/^\d+$/.test(low) || /^\d{4}$/.test(low)) return true;
+
+    var tech = [
+      /^\d+p$/i, /^(?:4k|uhd|fhd|hd|sd)$/i,
+      /^\d+([.,]\d+)?\s*(?:gb|гб|mb|мб|tb|тб)$/i,
+      /^(?:sdr|hdr\d*\+?|dolby\s*vision|dv|dovi)$/i,
+      /^(?:h\.?265|hevc|h\.?264|avc|x264|x265|vp9|av1|10bit|8bit)$/i,
+      /^(?:bdrip|web-?dl|web-?rip|remux|hdtv|camrip|ts|dvdrip)$/i,
+      /^(?:ac3|eac3|dts(?:-hd)?|truehd|atmos|aac|flac|mp3)$/i,
+      /^(?:5\.1|7\.1|2\.0|1\.0|\d+\s*ch)$/i,
+      /\.(?:mkv|mp4|avi|ts|m2ts)$/i
+    ];
+    for (var i = 0; i < tech.length; i++) {
+      if (tech[i].test(low)) return true;
+    }
+    return false;
+  }
+
+  function isRecognizedStudio(s) {
+    var low = s.toLowerCase().trim();
+    for (var i = 0; i < KNOWN_STUDIOS.length; i++) {
+      if (KNOWN_STUDIOS[i].toLowerCase() === low) return true;
+    }
+    for (var j = 0; j < VOICE_KEYWORDS.length; j++) {
+      if (VOICE_KEYWORDS[j].test(low)) return true;
+    }
+    return false;
+  }
 
   function parseVoiceStudios(raw) {
     if (!raw || typeof raw !== 'string') return [];
@@ -90,50 +162,42 @@
     if (m) {
       for (var i = 0; i < m.length; i++) {
         var cand = m[i].replace(/[()]/g, '').trim();
-        if (cand.indexOf(',') !== -1 || /[а-яёА-ЯЁ]/i.test(cand)) {
-          s = cand;
-          break;
-        }
+        if (isGarbageStudio(cand)) continue;
+        var sub = parseVoiceStudios(cand);
+        if (sub && sub.length) return sub;
       }
     }
 
+    var hasDelim = /[,/+|•]/.test(s);
     var parts = s.split(/[,/+|•]+/);
-    var techPatterns = [
-      /^\d+p$/i,
-      /^(?:4k|uhd|fhd|hd|sd)$/i,
-      /^\d+([.,]\d+)?\s*(?:gb|гб|mb|мб|tb|тб)$/i,
-      /^(?:sdr|hdr\d*\+?|dolby\s*vision|dv|dovi)$/i,
-      /^(?:h\.?265|hevc|h\.?264|avc|x264|x265|vp9|av1|10bit|8bit)$/i,
-      /^(?:bdrip|web-?dl|web-?rip|remux|hdtv|camrip|ts|dvdrip)$/i,
-      /^(?:ac3|eac3|dts(?:-hd)?|truehd|atmos|aac|flac|mp3)$/i,
-      /^(?:5\.1|7\.1|2\.0|1\.0|\d+\s*ch)$/i,
-      /^\d+$/
-    ];
-
     var studios = [];
     var seen = {};
 
-    for (var j = 0; j < parts.length; j++) {
-      var clean = parts[j].trim();
-      if (clean.length < 2) continue;
-
-      var low = clean.toLowerCase();
-      if (low === 'неизвестно' || low === 'unknown' || low === 'по умолчанию') continue;
-      if (/\.(mkv|mp4|avi|ts|m2ts)$/i.test(clean)) continue;
-      if (/s\d+\s*e\d+/i.test(clean)) continue;
-      if (/^\d+\s*(серия|сезон|эпизод|выпуск)/i.test(clean)) continue;
-
-      var isTech = false;
-      for (var k = 0; k < techPatterns.length; k++) {
-        if (techPatterns[k].test(clean)) {
-          isTech = true;
-          break;
+    if (hasDelim) {
+      for (var j = 0; j < parts.length; j++) {
+        var clean = parts[j].trim();
+        if (isGarbageStudio(clean)) continue;
+        var low = clean.toLowerCase();
+        if (!seen[low]) {
+          seen[low] = true;
+          studios.push(clean);
         }
       }
+    } else {
+      var cl = s.trim();
+      if (!isGarbageStudio(cl) && isRecognizedStudio(cl)) {
+        studios.push(cl);
+      }
+    }
 
-      if (!isTech && !seen[low]) {
-        seen[low] = true;
-        studios.push(clean);
+    if (!studios.length) {
+      for (var k = 0; k < KNOWN_STUDIOS.length; k++) {
+        var st = KNOWN_STUDIOS[k];
+        var lowSt = st.toLowerCase();
+        if (!seen[lowSt] && s.toLowerCase().indexOf(lowSt) !== -1) {
+          seen[lowSt] = true;
+          studios.push(st);
+        }
       }
     }
 
@@ -141,21 +205,47 @@
   }
 
   function extractMediaStudios(file, choice) {
-    var sources = [];
-    if (file) {
-      if (file.translate) sources.push(file.translate);
-      if (file.voice_name) sources.push(file.voice_name);
-      if (file.title) sources.push(file.title);
-      if (file.text) sources.push(file.text);
-    }
-    if (choice && choice.voice_name) {
-      sources.push(choice.voice_name);
+    var fileUrl = (file && (file.url || file.file)) || '';
+    var linkInfo = extractTorrentLinkInfo(fileUrl);
+    var hash = linkInfo.hash;
+
+    var candidates = [];
+
+    if (hash && torrentReleasesMap[hash]) {
+      candidates.push(torrentReleasesMap[hash]);
     }
 
-    for (var i = 0; i < sources.length; i++) {
-      var list = parseVoiceStudios(sources[i]);
-      if (list && list.length) return list;
+    if (file && file.translate) {
+      candidates.push(file.translate);
     }
+
+    if (activeReleaseVoice) {
+      candidates.push(activeReleaseVoice);
+    }
+
+    if (choice && choice.voice_name && choice.voice_name !== 'Неизвестно') {
+      candidates.push(choice.voice_name);
+    }
+
+    if (file && file.voice_name && file.voice_name !== 'Неизвестно') {
+      candidates.push(file.voice_name);
+    }
+
+    if (file && (file.name || file.text)) {
+      candidates.push(file.name || file.text);
+    }
+
+    if (file && file.title && file.title.indexOf('(') !== -1) {
+      candidates.push(file.title);
+    }
+
+    for (var i = 0; i < candidates.length; i++) {
+      var studios = parseVoiceStudios(candidates[i]);
+      if (studios && studios.length) {
+        return studios;
+      }
+    }
+
     return [];
   }
 
@@ -329,6 +419,17 @@
             if (a.stype == 'voice') {
               choice.voice_name = filter_find.voice[b.index].title;
               choice.voice_url = url;
+              activeReleaseVoice = choice.voice_name;
+              var vLink = extractTorrentLinkInfo(url);
+              if (vLink.hash) torrentReleasesMap[vLink.hash] = choice.voice_name;
+            } else if (a.stype == 'season') {
+              var sObj = filter_find.season[b.index];
+              if (sObj && sObj.title) {
+                var sSt2 = parseVoiceStudios(sObj.title);
+                if (sSt2 && sSt2.length) activeReleaseVoice = sObj.title;
+                var sLink2 = extractTorrentLinkInfo(url);
+                if (sLink2.hash) torrentReleasesMap[sLink2.hash] = sObj.title;
+              }
             }
             choice[a.stype] = b.index;
             _this.saveChoice(choice);
@@ -626,6 +727,29 @@
       try {
         var items = this.parseJsonDate(str, '.videos__item');
         var buttons = this.parseJsonDate(str, '.videos__button');
+
+        items.forEach(function (it) {
+          var itUrl = it.url || '';
+          var link = extractTorrentLinkInfo(itUrl);
+          if (link.hash) {
+            var voiceText = it.translate || it.voice_name || it.text || it.title;
+            var st = parseVoiceStudios(voiceText);
+            if (st && st.length) {
+              torrentReleasesMap[link.hash] = voiceText;
+            }
+          }
+        });
+
+        buttons.forEach(function (b) {
+          var bLink = extractTorrentLinkInfo(b.url || '');
+          if (bLink.hash && b.text) {
+            var st = parseVoiceStudios(b.text);
+            if (st && st.length) {
+              torrentReleasesMap[bLink.hash] = b.text;
+            }
+          }
+        });
+
         if (items.length == 1 && items[0].method == 'link' && !items[0].similar) {
           filter_find.season = items.map(function (s) {
             return {
@@ -678,6 +802,9 @@
                 this.request(find_voice_name.url);
               } else {
                 if (find_voice_active) {
+                  activeReleaseVoice = find_voice_active.text;
+                  var fLink = extractTorrentLinkInfo(find_voice_active.url || '');
+                  if (fLink.hash) torrentReleasesMap[fLink.hash] = find_voice_active.text;
                   this.replaceChoice({
                     voice: buttons.indexOf(find_voice_active),
                     voice_name: find_voice_active.text
@@ -689,7 +816,7 @@
               this.replaceChoice({
                 voice: 0,
                 voice_url: '',
-                voice_name: ''
+                voice_name: activeReleaseVoice || ''
               });
               this.display(videos);
             }
@@ -699,6 +826,11 @@
               this.loading(false);
             } else {
               filter_find.season = items.map(function (s) {
+                var sLink = extractTorrentLinkInfo(s.url || '');
+                if (sLink.hash) {
+                  var sSt = parseVoiceStudios(s.text);
+                  if (sSt && sSt.length) torrentReleasesMap[sLink.hash] = s.text;
+                }
                 return {
                   title: s.text,
                   url: s.url
@@ -707,6 +839,12 @@
               var select_season = this.getChoice(balanser).season;
               var season = filter_find.season[select_season];
               if (!season) season = filter_find.season[0];
+              if (season) {
+                var sLink2 = extractTorrentLinkInfo(season.url || '');
+                if (sLink2.hash) torrentReleasesMap[sLink2.hash] = season.title;
+                var sSt2 = parseVoiceStudios(season.title);
+                if (sSt2 && sSt2.length) activeReleaseVoice = season.title;
+              }
               this.request(season.url);
             }
           } else {
