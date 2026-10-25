@@ -430,13 +430,19 @@
     }
 
     function fixPlayerCrossOrigin() {
-        var video = (Lampa.PlayerVideo && Lampa.PlayerVideo.video && Lampa.PlayerVideo.video()) ||
-                    document.querySelector('video.player-video__video, video');
-        if (video) {
-            try {
-                video.removeAttribute('crossorigin');
-            } catch (e) {}
+        function removeAttr() {
+            var video = (Lampa.PlayerVideo && Lampa.PlayerVideo.video && Lampa.PlayerVideo.video()) ||
+                        document.querySelector('video.player-video__video, video');
+            if (video) {
+                try {
+                    video.removeAttribute('crossorigin');
+                } catch (e) {}
+            }
         }
+        removeAttr();
+        setTimeout(removeAttr, 100);
+        setTimeout(removeAttr, 300);
+        setTimeout(removeAttr, 600);
     }
 
     // ==========================================
@@ -929,11 +935,23 @@
             _this.loading(false);
             fixPlayerCrossOrigin();
 
+            var final_url = item.url;
+            if (!Lampa.Platform.is('android')) {
+                final_url = getProxy() + item.url;
+            }
+
+            var subs = (item.subtitles || []).map(function (s) {
+                return {
+                    label: s.label,
+                    url: !Lampa.Platform.is('android') ? getProxy() + s.url : s.url
+                };
+            });
+
             var player_item = {
                 title: item.title,
-                url: item.url,
+                url: final_url,
                 timeline: { hash: item.hash },
-                subtitles: item.subtitles || []
+                subtitles: subs
             };
 
             Lampa.Player.play(player_item);
@@ -945,9 +963,13 @@
                         episode: elem.episode,
                         season: elem.season,
                         url: function (call) {
+                            var f_url = elem.url;
+                            if (!Lampa.Platform.is('android')) {
+                                f_url = getProxy() + elem.url;
+                            }
                             call({
                                 title: 'Серия ' + elem.episode,
-                                url: elem.url,
+                                url: f_url,
                                 timeline: { hash: elem.hash },
                                 episode: elem.episode,
                                 season: elem.season
