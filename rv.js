@@ -442,16 +442,14 @@
     function detectRutubeQuality(v) {
         if (!v) return '1080p';
         var text = (v.title || '') + ' ' + (v.description || '');
-        if (/\b(?:4k|2160p|uhd)\b/i.test(text)) return '4K';
-        if (/\b(?:2k|1440p|qhd)\b/i.test(text)) return '2K';
-        if (/\b(?:1080p|fhd|full\s*hd|1080)\b/i.test(text)) return '1080p';
-        if (/\b(?:720p|hd\s*720|720)\b/i.test(text)) return '720p';
-        if (/\b(?:480p|sd|480)\b/i.test(text)) return '480p';
-        if (/\b(?:360p|360)\b/i.test(text)) return '360p';
+        // Rutube CDN не отдает потоки выше 1080p (любой 4K исходник транскодируется максимум в 1920x1080)
+        if (/\b(?:720p|hd\s*720|720)\b/i.test(text) && !/\b(?:1080|fhd|full\s*hd|4k|2k|uhd)\b/i.test(text)) return '720p';
+        if (/\b(?:480p|sd|480)\b/i.test(text) && !/\b(?:720|1080|fhd|full\s*hd|4k|2k|uhd)\b/i.test(text)) return '480p';
+        if (/\b(?:360p|360)\b/i.test(text) && !/\b(?:480|720|1080|fhd|full\s*hd|4k|2k|uhd)\b/i.test(text)) return '360p';
         return '1080p';
     }
 
-    function extractVkQualities(files) {
+    function extractVkQualities(files, title) {
         var qualities = {};
         var max_q = '1080p';
         var def_url = '';
@@ -482,6 +480,11 @@
         if (!def_url && files.hls) {
             def_url = files.hls;
             max_q = '1080p';
+        }
+
+        var is_hdr = /\b(?:hdr|hdr10|hlg|dolby\s*vision|dovi|dv)\b/i.test(title || '');
+        if (is_hdr) {
+            max_q += ' HDR';
         }
 
         return {
@@ -945,7 +948,7 @@
                                 if (v.duration < 300) return;
                                 if (!isSerialRelevant(v.title, movie.name || movie.title, movie.original_name || movie.original_title)) return;
 
-                                var q_info = extractVkQualities(v.files);
+                                var q_info = extractVkQualities(v.files, v.title);
                                 if (!q_info.default_url) return;
 
                                 seen_video_ids[v.id] = true;
@@ -1270,7 +1273,7 @@
                     if (v.duration < 1200) return; // от 20 минут
                     if (!isMovieRelevant(v.title, movie.title || movie.name, movie.original_title || movie.original_name)) return;
 
-                    var q_info = extractVkQualities(v.files);
+                    var q_info = extractVkQualities(v.files, v.title);
                     if (!q_info.default_url) return;
 
                     seen[v.id] = true;

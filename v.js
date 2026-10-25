@@ -378,7 +378,7 @@
         return null;
     }
 
-    function extractQualities(files) {
+    function extractQualities(files, title) {
         var qualities = {};
         var max_q = '1080p';
         var def_url = '';
@@ -411,6 +411,11 @@
             qualities['HLS'] = files.hls;
             def_url = files.hls;
             max_q = '1080p';
+        }
+
+        var is_hdr = /\b(?:hdr|hdr10|hlg|dolby\s*vision|dovi|dv)\b/i.test(title || '');
+        if (is_hdr) {
+            max_q += ' HDR';
         }
 
         return {
@@ -688,7 +693,7 @@
                             if (v.duration < 300) return;
                             if (!isSerialRelevant(v.title, movie.name || movie.title, movie.original_name || movie.original_title)) return;
 
-                            var q_info = extractQualities(v.files);
+                            var q_info = extractQualities(v.files, v.title);
                             if (!q_info.default_url) return;
 
                             seen_video_ids[v.id] = true;
@@ -861,7 +866,7 @@
                         if (v.duration < 2400) return;
                         if (!isMovieRelevant(v.title, movie.title || movie.name, movie.original_title || movie.original_name)) return;
 
-                        var q_info = extractQualities(v.files);
+                        var q_info = extractQualities(v.files, v.title);
                         if (!q_info.default_url) return;
 
                         var subs = [];
