@@ -345,11 +345,16 @@
     function detectRutubeQuality(v) {
         if (!v) return '1080p';
         var text = (v.title || '') + ' ' + (v.description || '');
-        // Rutube CDN не отдает потоки выше 1080p (любой 4K исходник транскодируется максимум в 1920x1080)
-        if (/\b(?:720p|hd\s*720|720)\b/i.test(text) && !/\b(?:1080|fhd|full\s*hd|4k|2k|uhd)\b/i.test(text)) return '720p';
-        if (/\b(?:480p|sd|480)\b/i.test(text) && !/\b(?:720|1080|fhd|full\s*hd|4k|2k|uhd)\b/i.test(text)) return '480p';
-        if (/\b(?:360p|360)\b/i.test(text) && !/\b(?:480|720|1080|fhd|full\s*hd|4k|2k|uhd)\b/i.test(text)) return '360p';
-        return '1080p';
+        var is_hdr = /\b(?:hdr10\+|hdr10|hdr|hlg|dolby\s*vision|dovi|dv)\b/i.test(text);
+
+        if (/\b(?:8k|4320p|4320)\b/i.test(text)) return is_hdr ? '8K HDR' : '8K';
+        if (/\b(?:4k|uhd|2160p|2160)\b/i.test(text)) return is_hdr ? '4K HDR' : '4K';
+        if (/\b(?:2k|qhd|1440p|1440)\b/i.test(text)) return is_hdr ? '2K HDR' : '2K';
+        if (/\b(?:1080p|1080|fhd|full\s*hd)\b/i.test(text)) return is_hdr ? '1080p HDR' : '1080p';
+        if (/\b(?:720p|hd\s*720|720)\b/i.test(text) && !/\b(?:1080|fhd|full\s*hd|4k|2k|uhd|8k)\b/i.test(text)) return is_hdr ? '720p HDR' : '720p';
+        if (/\b(?:480p|sd|480)\b/i.test(text) && !/\b(?:720|1080|fhd|full\s*hd|4k|2k|uhd|8k)\b/i.test(text)) return '480p';
+        if (/\b(?:360p|360)\b/i.test(text) && !/\b(?:480|720|1080|fhd|full\s*hd|4k|2k|uhd|8k)\b/i.test(text)) return '360p';
+        return is_hdr ? '1080p HDR' : '1080p';
     }
 
     function formatTime(sec) {
@@ -840,11 +845,11 @@
 
             _this.loading(true);
 
-            var play_url = 'https://rutube.ru/api/play/options/' + item.video_id + '/?no_404=true&referer=&pver=v2&client=wdp';
+            var play_url = 'https://rutube.ru/api/play/options/' + item.video_id + '/?no_404=true&referer=&pver=v2&client=wdp&mq=all&av1=1';
 
             apiRequest(play_url, {}, function (data) {
                 _this.loading(false);
-                var stream_url = data && data.video_balancer && data.video_balancer.m3u8;
+                var stream_url = data && data.video_balancer && (data.video_balancer.m3u8 || data.video_balancer.m3u8_m4s);
 
                 if (!stream_url) {
                     Lampa.Noty.show('Не удалось извлечь поток видео Rutube');
@@ -873,9 +878,9 @@
                             episode: elem.episode,
                             season: elem.season,
                             url: function (call) {
-                                var next_url = 'https://rutube.ru/api/play/options/' + elem.video_id + '/?no_404=true&referer=&pver=v2&client=wdp';
+                                var next_url = 'https://rutube.ru/api/play/options/' + elem.video_id + '/?no_404=true&referer=&pver=v2&client=wdp&mq=all&av1=1';
                                 apiRequest(next_url, {}, function (res) {
-                                    var next_m3u8 = res && res.video_balancer && res.video_balancer.m3u8;
+                                    var next_m3u8 = res && res.video_balancer && (res.video_balancer.m3u8 || res.video_balancer.m3u8_m4s);
                                     var next_final = next_m3u8;
                                     if (next_m3u8 && !Lampa.Platform.is('android')) {
                                         next_final = getProxy() + next_m3u8;
