@@ -462,7 +462,12 @@
     // ==========================================
     function RutubeComponent(object) {
         var _this = this;
-        var movie = object.movie || {};
+        var movie = Object.assign(
+            {},
+            (object && object.card) || {},
+            (object && object.data && object.data.movie) || {},
+            (object && object.movie) || {}
+        );
         var last_focused = null;
 
         var is_serial = Boolean(movie.number_of_seasons || movie.seasons || movie.first_air_date || movie.name);
@@ -576,7 +581,11 @@
             _this.loading(true);
             scroll.clear();
 
-            var search_title = cleanTitle(movie.name || movie.title);
+            var search_title = cleanTitle(movie.name || movie.title || movie.original_name || movie.original_title);
+            if (!search_title) {
+                _this.empty('Не удалось определить название сериала');
+                return;
+            }
             var queries = [
                 search_title + ' ' + season_num + ' сезон',
                 search_title + ' ' + season_num + ' сезон все серии'
@@ -768,8 +777,14 @@
             _this.loading(true);
             scroll.clear();
 
-            var search_title = cleanTitle(movie.title || movie.name);
+            var search_title = cleanTitle(movie.title || movie.name || movie.original_title || movie.original_name);
             var year = (movie.release_date || movie.first_air_date || '').substring(0, 4);
+
+            if (!search_title) {
+                _this.empty('Не удалось определить название фильма');
+                return;
+            }
+
             var query = encodeURIComponent(search_title + (year ? ' ' + year : ''));
             var url = 'https://rutube.ru/api/search/video/?query=' + query;
 
@@ -973,11 +988,17 @@
             });
 
             btn.on('hover:enter', function () {
+                var full_movie = Object.assign(
+                    {},
+                    (e.data && e.data.movie) || {},
+                    (e.object && e.object.card) || {},
+                    (e.object && e.object.movie) || {}
+                );
                 Lampa.Activity.push({
                     url: '',
                     title: 'Rutube',
                     component: 'rutube',
-                    movie: e.object.movie,
+                    movie: full_movie,
                     page: 1
                 });
             });

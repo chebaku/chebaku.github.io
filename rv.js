@@ -634,7 +634,12 @@
     // ==========================================
     function RUVKComponent(object) {
         var _this = this;
-        var movie = object.movie || {};
+        var movie = Object.assign(
+            {},
+            (object && object.card) || {},
+            (object && object.data && object.data.movie) || {},
+            (object && object.movie) || {}
+        );
         var last_focused = null;
 
         var is_serial = checkIfSerial(movie, object);
@@ -835,7 +840,11 @@
             _this.loading(true);
             scroll.clear();
 
-            var search_title = cleanTitle(movie.name || movie.title);
+            var search_title = cleanTitle(movie.name || movie.title || movie.original_name || movie.original_title);
+            if (!search_title) {
+                _this.empty('Не удалось определить название сериала');
+                return;
+            }
             var queries = [
                 search_title + ' ' + season_num + ' сезон',
                 search_title + ' ' + season_num + ' сезон все серии'
@@ -1158,8 +1167,13 @@
             _this.loading(true);
             scroll.clear();
 
-            var search_title = cleanTitle(movie.title || movie.name);
+            var search_title = cleanTitle(movie.title || movie.name || movie.original_title || movie.original_name);
             var year = (movie.release_date || movie.first_air_date || '').substring(0, 4);
+
+            if (!search_title) {
+                _this.empty('Не удалось определить название фильма');
+                return;
+            }
 
             if (src === 'rutube') {
                 var query_with_year = search_title + (year ? ' ' + year : '');
