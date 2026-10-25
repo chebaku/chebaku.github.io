@@ -199,6 +199,9 @@
     // ==========================================
     // VK Video API: Авторизация и Поиск
     // ==========================================
+    var token_fetching = false;
+    var token_callbacks = [];
+
     function getAnonymToken(callback, error_callback) {
         var token = Lampa.Storage.get('vk_anonym_token', '');
         var expires = Lampa.Storage.get('vk_token_expires', 0);
@@ -206,6 +209,10 @@
         if (token && expires && Date.now() < (expires - 60000)) {
             return callback(token);
         }
+
+        token_callbacks.push({ success: callback, error: error_callback });
+        if (token_fetching) return;
+        token_fetching = true;
 
         var auth_url = 'https://login.vk.com/?act=get_anonym_token';
         var body = 'client_secret=' + encodeURIComponent(VK_CLIENT_SECRET) +
@@ -219,18 +226,24 @@
             method: 'POST',
             body: body
         }, function (res) {
+            token_fetching = false;
             var access_token = res && res.data && res.data.access_token;
+            var cbs = token_callbacks.slice();
+            token_callbacks = [];
             if (access_token) {
                 var exp_seconds = (res.data.expires || res.data.expired_at || 0);
                 var exp_ms = exp_seconds ? exp_seconds * 1000 : (Date.now() + 10 * 3600 * 1000);
                 Lampa.Storage.set('vk_anonym_token', access_token);
                 Lampa.Storage.set('vk_token_expires', exp_ms);
-                callback(access_token);
+                cbs.forEach(function (cb) { cb.success(access_token); });
             } else {
-                if (error_callback) error_callback(new Error('Failed to get VK token'));
+                cbs.forEach(function (cb) { if (cb.error) cb.error(new Error('Failed to get VK token')); });
             }
         }, function (err) {
-            if (error_callback) error_callback(err);
+            token_fetching = false;
+            var cbs = token_callbacks.slice();
+            token_callbacks = [];
+            cbs.forEach(function (cb) { if (cb.error) cb.error(err); });
         });
     }
 
@@ -293,7 +306,6 @@
     ];
 
     var NOISE_REG = /трейлер|trailer|тизер|teaser|клип|обзор|прохождение|telltale|стрим|клим жуков|саундтрек|ost/i;
-
     var IRRELEVANT_CATEGORIES = /^(?:спорт|видеоигры|игры|новости и сми|новости|религия|авто-мото|авто|еда|кулинария|строительство|обучение)$/i;
 
     function isIrrelevantCategory(v) {
@@ -383,7 +395,7 @@
 
     function isCompilationVideo(title) {
         if (!title) return false;
-        return /(?:все\s*сери[ий]|весь\s*сезон|полный\s*сезон|сери[ии]\s*\d+\s*[-—–]\s*\d+|1\s*[-—–]\s*\d+\s*сери[ий])/i.test(title);
+        return /(?:все\s*сери[ий]|весь\s*сезон|полный\s*сезон|сери[ий]\s*\d+\s*[-—–]\s*\d+|1\s*[-—–]\s*\d+\s*сери[ий])/i.test(title);
     }
 
     function parseEpisodeNum(title, season_target) {
@@ -459,25 +471,23 @@
         for (var i = 0; i < order.length; i++) {
             var k = order[i];
             if (files[k]) {
-                var q_label = names[k];
-                qualities[q_label] = files[k];
                 if (!def_url) {
                     def_url = files[k];
-                    max_q = q_label;
+                    max_q = names[k];
                 }
+                qualities[names[k]] = files[k];
             }
         }
 
         if (!def_url && files.hls) {
-            qualities['HLS'] = files.hls;
             def_url = files.hls;
             max_q = '1080p';
         }
 
         return {
-            map: qualities,
             max: max_q,
-            default_url: def_url
+            default_url: def_url,
+            map: qualities
         };
     }
 
@@ -490,18 +500,6 @@
         return m + ' мин';
     }
 
-    function formatTimecode(sec) {
-        if (!sec && sec !== 0) return '00:00';
-        var s = Math.floor(sec % 60);
-        var m = Math.floor((sec / 60) % 60);
-        var h = Math.floor(sec / 3600);
-        var pad = function (n) { return (n < 10 ? '0' : '') + n; };
-        if (h > 0) {
-            return h + ':' + pad(m) + ':' + pad(s);
-        }
-        return pad(m) + ':' + pad(s);
-    }
-
     function fixPlayerCrossOrigin() {
         var video = (Lampa.PlayerVideo && Lampa.PlayerVideo.video && Lampa.PlayerVideo.video()) ||
                     document.querySelector('video.player-video__video, video');
@@ -510,6 +508,21 @@
                 video.removeAttribute('crossorigin');
             } catch (e) {}
         }
+    }
+
+    function checkIfSerial(m, o) {
+        m = m || {};
+        o = o || {};
+        var card = o.card || {};
+        if (m.number_of_seasons || card.number_of_seasons) return true;
+        if (m.seasons && m.seasons.length > 0) return true;
+        if (card.seasons && card.seasons.length > 0) return true;
+        if (m.type === 'tv' || m.type === 'serial' || o.type === 'tv' || card.type === 'tv') return true;
+        if (m.first_air_date || card.first_air_date) return true;
+        if (m.is_serial || card.is_serial) return true;
+        if (m.name && !m.title) return true;
+        if (card.name && !card.title) return true;
+        return false;
     }
 
     // ==========================================
@@ -610,18 +623,34 @@
         var movie = object.movie || {};
         var last_focused = null;
 
-        var is_serial = Boolean(movie.number_of_seasons || movie.seasons || movie.first_air_date || movie.name);
+        var is_serial = checkIfSerial(movie, object);
         var total_seasons = movie.number_of_seasons || (movie.seasons ? movie.seasons.length : 1);
         if (total_seasons < 1) total_seasons = 1;
 
         var current_season = 1;
-        var active_source = 'all'; // 'all' | 'vk' | 'rutube'
+        var active_source = 'rutube'; // Rutube открывается первым по умолчанию!
         var active_voice_filter = 'all';
         var voices_found = [];
 
-        var compilations_raw = [];
-        var episodes_map = {};
-        var movies_raw = [];
+        // Изолированное кэширование по источникам
+        var source_data = {
+            rutube: {
+                loaded: false,
+                season: 1,
+                movies: [],
+                compilations: [],
+                episodes: {},
+                voices: []
+            },
+            vk: {
+                loaded: false,
+                season: 1,
+                movies: [],
+                compilations: [],
+                episodes: {},
+                voices: []
+            }
+        };
 
         // DOM структура
         var container = $('<div class="ruvk-view"></div>');
@@ -639,9 +668,9 @@
             _this.loading(true);
 
             if (is_serial) {
-                _this.loadSeasonEpisodes(1);
+                _this.loadSeasonEpisodes(1, active_source);
             } else {
-                _this.loadMovie();
+                _this.loadMovie(active_source);
             }
 
             return _this.render();
@@ -673,11 +702,10 @@
         this.buildHeader = function () {
             header.empty();
 
-            // 1. Селектор Источника (Все / VK Видео / Rutube)
+            // 1. Селектор Источника (Rutube / VK Видео)
             var sources = [
-                { id: 'all', title: '🌐 Все' },
-                { id: 'vk', title: 'VK Видео' },
-                { id: 'rutube', title: 'Rutube' }
+                { id: 'rutube', title: 'Rutube' },
+                { id: 'vk', title: 'VK Видео' }
             ];
 
             sources.forEach(function (s) {
@@ -686,12 +714,34 @@
                     last_focused = this;
                 });
                 tab.on('hover:enter', function () {
+                    if (active_source === s.id) return;
                     active_source = s.id;
                     _this.buildHeader();
+
                     if (is_serial) {
-                        _this.renderEpisodesGrid();
+                        var cData = source_data[active_source];
+                        if (cData && cData.loaded && cData.season === current_season) {
+                            voices_found = cData.voices || [];
+                            active_voice_filter = 'all';
+                            _this.buildHeader();
+
+                            var has_any = (cData.compilations || []).length > 0 || Object.keys(cData.episodes || {}).length > 0;
+                            if (!has_any) {
+                                var sName = active_source === 'rutube' ? 'Rutube' : 'VK Видео';
+                                _this.empty('Серии для ' + current_season + ' сезона не найдены на ' + sName);
+                            } else {
+                                _this.renderEpisodesGrid();
+                            }
+                        } else {
+                            _this.loadSeasonEpisodes(current_season, active_source);
+                        }
                     } else {
-                        _this.renderMoviesGrid();
+                        var mData = source_data[active_source];
+                        if (mData && mData.loaded) {
+                            _this.finishLoadingMovie(active_source);
+                        } else {
+                            _this.loadMovie(active_source);
+                        }
                     }
                 });
                 header.append(tab);
@@ -717,7 +767,9 @@
                         items: s_items,
                         onSelect: function (sel) {
                             current_season = sel.season;
-                            _this.loadSeasonEpisodes(sel.season);
+                            source_data.rutube.loaded = false;
+                            source_data.vk.loaded = false;
+                            _this.loadSeasonEpisodes(sel.season, active_source);
                         },
                         onBack: function () {
                             _this.start();
@@ -727,7 +779,7 @@
                 header.append(season_btn);
             }
 
-            // 3. Селектор Озвучки (если найдено несколько студий)
+            // 3. Селектор Озвучки (если в активном источнике найдено несколько студий)
             if (voices_found.length > 1) {
                 var v_label = active_voice_filter === 'all' ? 'Все озвучки' : active_voice_filter;
                 var voice_btn = $(`<div class="selector ruvk-tab">🎙️ ${v_label} ▾</div>`);
@@ -761,10 +813,11 @@
         };
 
         // ------------------------------------------
-        // Режим Сериала: Загрузка серий сезона (VK + Rutube)
+        // Режим Сериала: Загрузка серий сезона
         // ------------------------------------------
-        this.loadSeasonEpisodes = function (season_num) {
+        this.loadSeasonEpisodes = function (season_num, source) {
             current_season = season_num;
+            var src = source || active_source;
             _this.loading(true);
             scroll.clear();
 
@@ -776,183 +829,192 @@
             if (season_num === 1) {
                 queries.push(search_title + ' все серии');
                 queries.push(search_title + ' 1 сезон все серии');
+                queries.push(search_title + ' 1 серия');
             }
 
-            compilations_raw = [];
-            episodes_map = {};
+            var comp_list = [];
+            var ep_map = {};
             var detected_voices = {};
             var seen_video_ids = {};
-
-            var total_queries = queries.length * 2; // VK + Rutube
-            var pending = total_queries;
+            var pending = queries.length;
 
             function checkFinish() {
                 pending--;
                 if (pending > 0) return;
 
-                voices_found = Object.keys(detected_voices);
-                active_voice_filter = 'all';
+                var v_keys = Object.keys(detected_voices);
+                source_data[src] = {
+                    loaded: true,
+                    season: season_num,
+                    compilations: comp_list,
+                    episodes: ep_map,
+                    voices: v_keys
+                };
 
-                _this.buildHeader();
+                if (src === active_source) {
+                    voices_found = v_keys;
+                    active_voice_filter = 'all';
+                    _this.loading(false);
+                    _this.buildHeader();
 
-                var has_any = compilations_raw.length > 0 || Object.keys(episodes_map).length > 0;
-                if (!has_any) {
-                    _this.empty('Серии для ' + season_num + ' сезона не найдены');
-                } else {
-                    _this.renderEpisodesGrid();
+                    var has_any = comp_list.length > 0 || Object.keys(ep_map).length > 0;
+                    if (!has_any) {
+                        var src_name = active_source === 'rutube' ? 'Rutube' : 'VK Видео';
+                        _this.empty('Серии для ' + season_num + ' сезона не найдены на ' + src_name);
+                    } else {
+                        _this.renderEpisodesGrid();
+                    }
                 }
             }
 
-            // Запросы в VK Видео
-            queries.forEach(function (q) {
-                searchVk(q, function (videos) {
-                    if (Array.isArray(videos)) {
-                        videos.forEach(function (item) {
-                            var v = item && item.video;
-                            if (!v || !v.files || seen_video_ids['vk_' + v.id]) return;
-                            if (NOISE_REG.test(v.title)) return;
-                            if (v.duration < 300) return;
-                            if (!isSerialRelevant(v.title, movie.name || movie.title, movie.original_name || movie.original_title)) return;
+            if (src === 'rutube') {
+                queries.forEach(function (q) {
+                    searchRutube(q, function (results) {
+                        if (Array.isArray(results)) {
+                            results.forEach(function (v) {
+                                if (!v || v.is_deleted || v.is_hidden || v.is_locked || v.is_audio || v.is_paid || v.is_livestream) return;
+                                if (seen_video_ids[v.id]) return;
+                                if (isIrrelevantCategory(v)) return;
+                                if (NOISE_REG.test(v.title)) return;
+                                if (v.duration < 300) return;
+                                if (!isSerialRelevant(v.title, movie.name || movie.title, movie.original_name || movie.original_title)) return;
 
-                            var q_info = extractVkQualities(v.files);
-                            if (!q_info.default_url) return;
+                                seen_video_ids[v.id] = true;
 
-                            seen_video_ids['vk_' + v.id] = true;
+                                var voice = detectVoice(v.title) || detectVoice(v.description) || 'Оригинал / Залив';
+                                if (voice) detected_voices[voice] = true;
 
-                            var voice = detectVoice(v.title) || detectVoice(v.description) || 'Оригинал / Залив';
-                            if (voice) detected_voices[voice] = true;
+                                var quality = detectRutubeQuality(v);
 
-                            var subs = [];
-                            if (v.subtitles) {
-                                v.subtitles.forEach(function (s) {
-                                    if (s && s.url) subs.push({ label: s.title || s.lang || 'Субтитры', url: s.url });
-                                });
-                            }
-
-                            // Проверяем, сборник ли это ("Все серии" / "Весь сезон")
-                            if (isCompilationVideo(v.title)) {
-                                var sm = v.title.match(/(?:(\d+)\s*(?:сезон|season|s))/i);
-                                if (!sm || parseInt(sm[1], 10) === season_num) {
-                                    compilations_raw.push({
-                                        source: 'vk',
-                                        title: v.title,
-                                        video_id: v.id,
-                                        duration: v.duration,
-                                        voice: voice,
-                                        quality: q_info.max,
-                                        url: q_info.default_url,
-                                        qualities: q_info.map,
-                                        subtitles: subs,
-                                        hash: Lampa.Utils.hash('ruvk_vk_comp_' + (movie.id || search_title) + '_s' + season_num + '_' + v.id)
-                                    });
-                                    return;
+                                if (isCompilationVideo(v.title)) {
+                                    var sm = v.title.match(/(?:(\d+)\s*(?:сезон|season|s))/i);
+                                    if (!sm || parseInt(sm[1], 10) === season_num) {
+                                        comp_list.push({
+                                            source: 'rutube',
+                                            title: v.title,
+                                            video_id: v.id,
+                                            duration: v.duration,
+                                            voice: voice,
+                                            quality: quality,
+                                            author: v.author ? v.author.name : '',
+                                            hash: Lampa.Utils.hash('ruvk_rutube_comp_' + (movie.id || search_title) + '_s' + season_num + '_' + v.id)
+                                        });
+                                        return;
+                                    }
                                 }
-                            }
 
-                            var ep_num = parseEpisodeNum(v.title, season_num);
-                            if (!ep_num) return;
+                                var ep_num = parseEpisodeNum(v.title, season_num);
+                                if (!ep_num) return;
 
-                            var ep_obj = {
-                                source: 'vk',
-                                episode: ep_num,
-                                season: season_num,
-                                title: v.title,
-                                video_id: v.id,
-                                duration: v.duration,
-                                voice: voice,
-                                quality: q_info.max,
-                                url: q_info.default_url,
-                                qualities: q_info.map,
-                                subtitles: subs,
-                                hash: Lampa.Utils.hash('ruvk_vk_' + (movie.id || search_title) + '_s' + season_num + 'e' + ep_num + '_' + v.id)
-                            };
+                                var ep_obj = {
+                                    source: 'rutube',
+                                    episode: ep_num,
+                                    season: season_num,
+                                    title: v.title,
+                                    video_id: v.id,
+                                    duration: v.duration,
+                                    voice: voice,
+                                    quality: quality,
+                                    author: v.author ? v.author.name : '',
+                                    hash: Lampa.Utils.hash('ruvk_rutube_' + (movie.id || search_title) + '_s' + season_num + 'e' + ep_num + '_' + v.id)
+                                };
 
-                            if (!episodes_map[ep_num]) episodes_map[ep_num] = [];
-                            episodes_map[ep_num].push(ep_obj);
-                        });
-                    }
-                    checkFinish();
-                }, function () {
-                    checkFinish();
+                                if (!ep_map[ep_num]) ep_map[ep_num] = [];
+                                ep_map[ep_num].push(ep_obj);
+                            });
+                        }
+                        checkFinish();
+                    }, function () {
+                        checkFinish();
+                    });
                 });
-            });
+            } else if (src === 'vk') {
+                queries.forEach(function (q) {
+                    searchVk(q, function (videos) {
+                        if (Array.isArray(videos)) {
+                            videos.forEach(function (item) {
+                                var v = item && item.video;
+                                if (!v || !v.files || seen_video_ids[v.id]) return;
+                                if (NOISE_REG.test(v.title)) return;
+                                if (v.duration < 300) return;
+                                if (!isSerialRelevant(v.title, movie.name || movie.title, movie.original_name || movie.original_title)) return;
 
-            // Запросы в Rutube
-            queries.forEach(function (q) {
-                searchRutube(q, function (results) {
-                    if (Array.isArray(results)) {
-                        results.forEach(function (v) {
-                            if (!v || v.is_deleted || v.is_hidden || v.is_locked || v.is_audio || v.is_paid || v.is_livestream) return;
-                            if (seen_video_ids['rutube_' + v.id]) return;
-                            if (isIrrelevantCategory(v)) return;
-                            if (NOISE_REG.test(v.title)) return;
-                            if (v.duration < 300) return;
-                            if (!isSerialRelevant(v.title, movie.name || movie.title, movie.original_name || movie.original_title)) return;
+                                var q_info = extractVkQualities(v.files);
+                                if (!q_info.default_url) return;
 
-                            seen_video_ids['rutube_' + v.id] = true;
+                                seen_video_ids[v.id] = true;
 
-                            var voice = detectVoice(v.title) || detectVoice(v.description) || 'Оригинал / Залив';
-                            if (voice) detected_voices[voice] = true;
+                                var voice = detectVoice(v.title) || detectVoice(v.description) || 'Оригинал / Залив';
+                                if (voice) detected_voices[voice] = true;
 
-                            var quality = detectRutubeQuality(v);
-
-                            // Проверяем сборник ("Все серии")
-                            if (isCompilationVideo(v.title)) {
-                                var sm = v.title.match(/(?:(\d+)\s*(?:сезон|season|s))/i);
-                                if (!sm || parseInt(sm[1], 10) === season_num) {
-                                    compilations_raw.push({
-                                        source: 'rutube',
-                                        title: v.title,
-                                        video_id: v.id,
-                                        duration: v.duration,
-                                        voice: voice,
-                                        quality: quality,
-                                        author: v.author ? v.author.name : '',
-                                        hash: Lampa.Utils.hash('ruvk_rutube_comp_' + (movie.id || search_title) + '_s' + season_num + '_' + v.id)
+                                var subs = [];
+                                if (v.subtitles) {
+                                    v.subtitles.forEach(function (s) {
+                                        if (s && s.url) subs.push({ label: s.title || s.lang || 'Субтитры', url: s.url });
                                     });
-                                    return;
                                 }
-                            }
 
-                            var ep_num = parseEpisodeNum(v.title, season_num);
-                            if (!ep_num) return;
+                                if (isCompilationVideo(v.title)) {
+                                    var sm = v.title.match(/(?:(\d+)\s*(?:сезон|season|s))/i);
+                                    if (!sm || parseInt(sm[1], 10) === season_num) {
+                                        comp_list.push({
+                                            source: 'vk',
+                                            title: v.title,
+                                            video_id: v.id,
+                                            duration: v.duration,
+                                            voice: voice,
+                                            quality: q_info.max,
+                                            url: q_info.default_url,
+                                            qualities: q_info.map,
+                                            subtitles: subs,
+                                            hash: Lampa.Utils.hash('ruvk_vk_comp_' + (movie.id || search_title) + '_s' + season_num + '_' + v.id)
+                                        });
+                                        return;
+                                    }
+                                }
 
-                            var ep_obj = {
-                                source: 'rutube',
-                                episode: ep_num,
-                                season: season_num,
-                                title: v.title,
-                                video_id: v.id,
-                                duration: v.duration,
-                                voice: voice,
-                                quality: quality,
-                                author: v.author ? v.author.name : '',
-                                hash: Lampa.Utils.hash('ruvk_rutube_' + (movie.id || search_title) + '_s' + season_num + 'e' + ep_num + '_' + v.id)
-                            };
+                                var ep_num = parseEpisodeNum(v.title, season_num);
+                                if (!ep_num) return;
 
-                            if (!episodes_map[ep_num]) episodes_map[ep_num] = [];
-                            episodes_map[ep_num].push(ep_obj);
-                        });
-                    }
-                    checkFinish();
-                }, function () {
-                    checkFinish();
+                                var ep_obj = {
+                                    source: 'vk',
+                                    episode: ep_num,
+                                    season: season_num,
+                                    title: v.title,
+                                    video_id: v.id,
+                                    duration: v.duration,
+                                    voice: voice,
+                                    quality: q_info.max,
+                                    url: q_info.default_url,
+                                    qualities: q_info.map,
+                                    subtitles: subs,
+                                    hash: Lampa.Utils.hash('ruvk_vk_' + (movie.id || search_title) + '_s' + season_num + 'e' + ep_num + '_' + v.id)
+                                };
+
+                                if (!ep_map[ep_num]) ep_map[ep_num] = [];
+                                ep_map[ep_num].push(ep_obj);
+                            });
+                        }
+                        checkFinish();
+                    }, function () {
+                        checkFinish();
+                    });
                 });
-            });
+            }
         };
 
         // ------------------------------------------
-        // Отрисовка списка серий + длинных сериалов (Все серии)
+        // Отрисовка списка серий + сборников
         // ------------------------------------------
         this.renderEpisodesGrid = function () {
             scroll.clear();
             _this.loading(false);
 
-            var items_to_play = [];
+            var cData = source_data[active_source];
+            if (!cData) return;
 
-            // 1. Отрисовка длинных сириков ("Все серии" / "Весь сезон")
-            var comps = compilations_raw.filter(function (c) {
-                if (active_source !== 'all' && c.source !== active_source) return false;
+            // 1. Длинные сборники (Все серии)
+            var comps = (cData.compilations || []).filter(function (c) {
                 if (active_voice_filter !== 'all' && c.voice !== active_voice_filter) return false;
                 return true;
             });
@@ -992,24 +1054,21 @@
                 scroll.append(item);
             });
 
-            // 2. Отрисовка отдельных серий
-            var ep_numbers = Object.keys(episodes_map).map(function (k) { return parseInt(k, 10); });
+            // 2. Отдельные серии
+            var ep_map = cData.episodes || {};
+            var ep_numbers = Object.keys(ep_map).map(function (k) { return parseInt(k, 10); });
             ep_numbers.sort(function (a, b) { return a - b; });
 
             var flat_episodes = [];
-
             ep_numbers.forEach(function (ep_num) {
-                var variants = episodes_map[ep_num] || [];
-                var filtered = variants.filter(function (v) {
-                    if (active_source !== 'all' && v.source !== active_source) return false;
+                var variants = (ep_map[ep_num] || []).filter(function (v) {
                     if (active_voice_filter !== 'all' && v.voice !== active_voice_filter) return false;
                     return true;
                 });
+                if (variants.length === 0) return;
 
-                if (filtered.length === 0) return;
-
-                var chosen = filtered[0];
-                flat_episodes.push({ chosen: chosen, all_variants: filtered });
+                var chosen = variants[0];
+                flat_episodes.push({ chosen: chosen, all_variants: variants });
             });
 
             var playlist_for_autoplay = flat_episodes.map(function (f) { return f.chosen; });
@@ -1044,11 +1103,10 @@
                 });
 
                 item.on('hover:enter', function () {
-                    if (variants.length > 1 && active_source === 'all' && active_voice_filter === 'all') {
-                        var sel_items = variants.map(function (v, v_idx) {
-                            var v_src = v.source === 'vk' ? 'VK Видео' : 'Rutube';
+                    if (variants.length > 1) {
+                        var sel_items = variants.map(function (v) {
                             return {
-                                title: `[${v_src}] ${v.voice || 'Оригинал'} • ${v.quality} (${formatTime(v.duration)})`,
+                                title: `${v.voice || 'Оригинал'} • ${v.quality} (${formatTime(v.duration)})`,
                                 variant: v
                             };
                         });
@@ -1071,99 +1129,180 @@
                 scroll.append(item);
             });
 
+            if (comps.length === 0 && flat_episodes.length === 0) {
+                scroll.append($('<div class="empty__descr" style="padding: 2.5em 1em; text-align: center; opacity: 0.7; font-size: 1.1em;">Нет релизов для выбранных фильтров</div>'));
+            }
+
             _this.start();
         };
 
         // ------------------------------------------
-        // Режим Фильма: Поиск фильма (VK + Rutube)
+        // Режим Фильма: Поиск фильма
         // ------------------------------------------
-        this.loadMovie = function () {
+        this.loadMovie = function (source) {
+            var src = source || active_source;
             _this.loading(true);
             scroll.clear();
 
             var search_title = cleanTitle(movie.title || movie.name);
             var year = (movie.release_date || movie.first_air_date || '').substring(0, 4);
-            var query = search_title + (year ? ' ' + year : '');
 
-            movies_raw = [];
-            var pending = 2;
-
-            function checkFinish() {
-                pending--;
-                if (pending > 0) return;
-
-                _this.buildHeader();
-
-                if (movies_raw.length === 0) {
-                    _this.empty('Фильм не найден на VK Видео и Rutube');
-                } else {
-                    _this.renderMoviesGrid();
-                }
+            if (src === 'rutube') {
+                var query_with_year = search_title + (year ? ' ' + year : '');
+                searchRutube(query_with_year, function (results) {
+                    var items = _this.processRutubeMovieResults(results, search_title);
+                    if (items.length === 0 && year) {
+                        searchRutube(search_title, function (fallback_results) {
+                            var fb_items = _this.processRutubeMovieResults(fallback_results, search_title);
+                            source_data.rutube.movies = fb_items;
+                            source_data.rutube.loaded = true;
+                            _this.finishLoadingMovie('rutube');
+                        }, function () {
+                            source_data.rutube.movies = [];
+                            source_data.rutube.loaded = true;
+                            _this.finishLoadingMovie('rutube');
+                        });
+                    } else {
+                        source_data.rutube.movies = items;
+                        source_data.rutube.loaded = true;
+                        _this.finishLoadingMovie('rutube');
+                    }
+                }, function () {
+                    if (year) {
+                        searchRutube(search_title, function (fallback_results) {
+                            var fb_items = _this.processRutubeMovieResults(fallback_results, search_title);
+                            source_data.rutube.movies = fb_items;
+                            source_data.rutube.loaded = true;
+                            _this.finishLoadingMovie('rutube');
+                        }, function () {
+                            source_data.rutube.movies = [];
+                            source_data.rutube.loaded = true;
+                            _this.finishLoadingMovie('rutube');
+                        });
+                    } else {
+                        source_data.rutube.movies = [];
+                        source_data.rutube.loaded = true;
+                        _this.finishLoadingMovie('rutube');
+                    }
+                });
+            } else if (src === 'vk') {
+                var query_with_year = search_title + (year ? ' ' + year : '');
+                searchVk(query_with_year, function (videos) {
+                    var items = _this.processVkMovieResults(videos, search_title);
+                    if (items.length === 0 && year) {
+                        searchVk(search_title, function (fallback_videos) {
+                            var fb_items = _this.processVkMovieResults(fallback_videos, search_title);
+                            source_data.vk.movies = fb_items;
+                            source_data.vk.loaded = true;
+                            _this.finishLoadingMovie('vk');
+                        }, function () {
+                            source_data.vk.movies = [];
+                            source_data.vk.loaded = true;
+                            _this.finishLoadingMovie('vk');
+                        });
+                    } else {
+                        source_data.vk.movies = items;
+                        source_data.vk.loaded = true;
+                        _this.finishLoadingMovie('vk');
+                    }
+                }, function () {
+                    if (year) {
+                        searchVk(search_title, function (fallback_videos) {
+                            var fb_items = _this.processVkMovieResults(fallback_videos, search_title);
+                            source_data.vk.movies = fb_items;
+                            source_data.vk.loaded = true;
+                            _this.finishLoadingMovie('vk');
+                        }, function () {
+                            source_data.vk.movies = [];
+                            source_data.vk.loaded = true;
+                            _this.finishLoadingMovie('vk');
+                        });
+                    } else {
+                        source_data.vk.movies = [];
+                        source_data.vk.loaded = true;
+                        _this.finishLoadingMovie('vk');
+                    }
+                });
             }
+        };
 
-            // Поиск в VK
-            searchVk(query, function (videos) {
-                if (Array.isArray(videos)) {
-                    videos.forEach(function (item) {
-                        var v = item && item.video;
-                        if (!v || !v.files) return;
-                        if (NOISE_REG.test(v.title)) return;
-                        if (v.duration < 2400) return; // фильмы от 40 минут
-                        if (!isMovieRelevant(v.title, movie.title || movie.name, movie.original_title || movie.original_name)) return;
+        this.processRutubeMovieResults = function (results, search_title) {
+            var items = [];
+            var seen = {};
+            if (Array.isArray(results)) {
+                results.forEach(function (v) {
+                    if (!v || v.is_deleted || v.is_hidden || v.is_locked || v.is_audio || v.is_paid || v.is_livestream) return;
+                    if (seen[v.id]) return;
+                    if (isIrrelevantCategory(v)) return;
+                    if (NOISE_REG.test(v.title)) return;
+                    if (v.duration < 1200) return; // от 20 минут
+                    if (!isMovieRelevant(v.title, movie.title || movie.name, movie.original_title || movie.original_name)) return;
 
-                        var q_info = extractVkQualities(v.files);
-                        if (!q_info.default_url) return;
-
-                        var subs = [];
-                        if (v.subtitles) {
-                            v.subtitles.forEach(function (s) {
-                                if (s && s.url) subs.push({ label: s.title || s.lang || 'Субтитры', url: s.url });
-                            });
-                        }
-
-                        movies_raw.push({
-                            source: 'vk',
-                            title: v.title,
-                            video_id: v.id,
-                            duration: v.duration,
-                            quality: q_info.max,
-                            url: q_info.default_url,
-                            qualities: q_info.map,
-                            subtitles: subs,
-                            hash: Lampa.Utils.hash('ruvk_movie_vk_' + (movie.id || search_title) + '_' + v.id)
-                        });
+                    seen[v.id] = true;
+                    items.push({
+                        source: 'rutube',
+                        title: v.title,
+                        video_id: v.id,
+                        duration: v.duration,
+                        author: v.author ? v.author.name : '',
+                        quality: detectRutubeQuality(v),
+                        hash: Lampa.Utils.hash('ruvk_movie_rutube_' + (movie.id || search_title) + '_' + v.id)
                     });
-                }
-                checkFinish();
-            }, function () {
-                checkFinish();
-            });
+                });
+            }
+            return items;
+        };
 
-            // Поиск в Rutube
-            searchRutube(query, function (results) {
-                if (Array.isArray(results)) {
-                    results.forEach(function (v) {
-                        if (!v || v.is_deleted || v.is_hidden || v.is_locked || v.is_audio || v.is_paid || v.is_livestream) return;
-                        if (isIrrelevantCategory(v)) return;
-                        if (NOISE_REG.test(v.title)) return;
-                        if (v.duration < 2400) return;
-                        if (!isMovieRelevant(v.title, movie.title || movie.name, movie.original_title || movie.original_name)) return;
+        this.processVkMovieResults = function (videos, search_title) {
+            var items = [];
+            var seen = {};
+            if (Array.isArray(videos)) {
+                videos.forEach(function (item) {
+                    var v = item && item.video;
+                    if (!v || !v.files || seen[v.id]) return;
+                    if (NOISE_REG.test(v.title)) return;
+                    if (v.duration < 1200) return; // от 20 минут
+                    if (!isMovieRelevant(v.title, movie.title || movie.name, movie.original_title || movie.original_name)) return;
 
-                        movies_raw.push({
-                            source: 'rutube',
-                            title: v.title,
-                            video_id: v.id,
-                            duration: v.duration,
-                            author: v.author ? v.author.name : '',
-                            quality: detectRutubeQuality(v),
-                            hash: Lampa.Utils.hash('ruvk_movie_rutube_' + (movie.id || search_title) + '_' + v.id)
+                    var q_info = extractVkQualities(v.files);
+                    if (!q_info.default_url) return;
+
+                    seen[v.id] = true;
+                    var subs = [];
+                    if (v.subtitles) {
+                        v.subtitles.forEach(function (s) {
+                            if (s && s.url) subs.push({ label: s.title || s.lang || 'Субтитры', url: s.url });
                         });
+                    }
+
+                    items.push({
+                        source: 'vk',
+                        title: v.title,
+                        video_id: v.id,
+                        duration: v.duration,
+                        quality: q_info.max,
+                        url: q_info.default_url,
+                        qualities: q_info.map,
+                        subtitles: subs,
+                        hash: Lampa.Utils.hash('ruvk_movie_vk_' + (movie.id || search_title) + '_' + v.id)
                     });
-                }
-                checkFinish();
-            }, function () {
-                checkFinish();
-            });
+                });
+            }
+            return items;
+        };
+
+        this.finishLoadingMovie = function (src) {
+            if (src !== active_source) return;
+            _this.loading(false);
+            _this.buildHeader();
+
+            var list = (source_data[active_source] && source_data[active_source].movies) || [];
+            if (list.length === 0) {
+                var src_name = active_source === 'rutube' ? 'Rutube' : 'VK Видео';
+                _this.empty('В источнике ' + src_name + ' фильм не найден');
+            } else {
+                _this.renderMoviesGrid();
+            }
         };
 
         // ------------------------------------------
@@ -1173,17 +1312,15 @@
             scroll.clear();
             _this.loading(false);
 
-            var filtered = movies_raw.filter(function (m) {
-                if (active_source !== 'all' && m.source !== active_source) return false;
-                return true;
-            });
+            var movies = (source_data[active_source] && source_data[active_source].movies) || [];
 
-            if (filtered.length === 0) {
-                _this.empty('В выбранном источнике фильм не найден');
+            if (movies.length === 0) {
+                var src_name = active_source === 'rutube' ? 'Rutube' : 'VK Видео';
+                _this.empty('В источнике ' + src_name + ' фильм не найден');
                 return;
             }
 
-            filtered.forEach(function (m_item) {
+            movies.forEach(function (m_item) {
                 var is_vk = m_item.source === 'vk';
                 var s_icon = is_vk ? ICON_VK : ICON_RUTUBE;
                 var badge_color = is_vk ? '#0077FF' : '#E62117';
@@ -1239,7 +1376,6 @@
 
                 Lampa.Player.play(player_item);
 
-                // Динамический плейлист автоперехода
                 if (playlist_items && playlist_items.length > 1) {
                     var playlist = playlist_items.map(function (elem) {
                         return {
@@ -1407,7 +1543,7 @@
     Lampa.Listener.follow('full', function (e) {
         if (e.type === 'complite') {
             var btn = $(`
-                <div class="full-start__button selector ruvk-open-btn" style="background: linear-gradient(135deg, rgba(0, 119, 255, 0.28) 0%, rgba(230, 33, 23, 0.28) 100%); border: 1px solid rgba(255, 255, 255, 0.2);">
+                <div class="full-start__button selector ruvk-open-btn" style="background: linear-gradient(135deg, rgba(230, 33, 23, 0.28) 0%, rgba(0, 119, 255, 0.28) 100%); border: 1px solid rgba(255, 255, 255, 0.2);">
                     <svg style="height: 1.5em; width: 1.5em; margin-right: 0.5em; vertical-align: middle;" viewBox="0 0 24 24" fill="none">
                         <path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm-2 14.5v-9l6 4.5-6 4.5z" fill="#fff"/>
                     </svg>
@@ -1422,11 +1558,17 @@
             });
 
             btn.on('hover:enter', function () {
+                var full_movie = Object.assign(
+                    {},
+                    (e.data && e.data.movie) || {},
+                    (e.object && e.object.card) || {},
+                    (e.object && e.object.movie) || {}
+                );
                 Lampa.Activity.push({
                     url: '',
                     title: 'VK / Rutube',
                     component: 'ruvk',
-                    movie: e.object.movie,
+                    movie: full_movie,
                     page: 1
                 });
             });
